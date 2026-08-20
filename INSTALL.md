@@ -42,13 +42,15 @@ New-Item -ItemType Junction -Path $prof -Target $cli -Force
 
 ### C. 编译（源码改动后必须做）
 
-在 **DSH 仓库根目录**执行（不是在插件目录）：
+在 **DSH 仓库根目录**执行（不是在插件目录）。把 `<本仓库路径>` 换成本仓库的绝对路径（如 `D:\dsh-agent-plugins`）：
 
 ```powershell
 pnpm install --offline --prefer-offline        # 首次，注册 workspace 依赖
-pnpm exec tsc --build packages/extensions/agent-plugins/tsconfig.json
-pnpm exec tsdown --env.DSH_BUILD_FACE host     # 重新生成 lib/index.js（运行中的 DSH 读的是 lib）
+pnpm exec tsc --build <本仓库路径>\tsconfig.json
+pnpm exec tsdown --env.DSH_BUILD_FACE host     # 重新生成 <本仓库路径>\lib\index.js（运行中的 DSH 读的是 lib）
 ```
+
+> 本仓库的 `package.json` 用 `workspace:^` 依赖，只有 DSH 仓库的 pnpm workspace 能解析；junction 已让 DSH workspace 通过 `apps\cli\node_modules` 看到本仓库，所以 tsc/tsdown 直接指向本仓库路径即可。
 
 ### D. 重启 DSH 验证
 
@@ -73,13 +75,22 @@ pnpm exec tsdown --env.DSH_BUILD_FACE host     # 重新生成 lib/index.js（运
 ## 验证清单（装完 / 改完都要过）
 
 ```powershell
-pnpm exec tsc --build packages/extensions/agent-plugins/tsconfig.json
-pnpm exec vitest run packages/extensions/agent-plugins/tests
-pnpm exec oxlint packages/extensions/agent-plugins
+pnpm exec tsc --build <本仓库路径>\tsconfig.json
+pnpm exec vitest run <本仓库路径>\tests
+pnpm exec oxlint <本仓库路径>
 pnpm run constraints
 ```
 
 三条全绿才叫"编译/测试通过"；运行态验证（技能目录出现、MCP 工具出现）需要重启 DSH 后看会话。
+
+## 迭代工作流（改了代码之后）
+
+1. 在本仓库改 `src/` / `tests/`；
+2. 在 DSH 仓库根目录跑上面的验证清单 + `pnpm exec tsdown --env.DSH_BUILD_FACE host` 重建 lib；
+3. 重启 DSH，检查活跃会话技能目录符合全局过滤（`~/.dsh/agent-plugins.yml`）；
+4. 全绿后在本仓库 `git add`（只加改动文件，`lib/` 被 ignore）→ commit → push。
+
+详见 `AGENTS.md` 的「迭代工作流」——AI 接手时会先读那份。
 
 ## 常见误操作（别人踩过的坑）
 
