@@ -1,0 +1,6 @@
+# 构建产物（在 DSH 仓库内编译生成）
+lib/
+
+# 依赖（在 DSH workspace 内安装）
+node_modules/
+*.tsbuildinfo

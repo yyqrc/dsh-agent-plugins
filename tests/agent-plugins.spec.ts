@@ -1,0 +1,301 @@
+/**
+ * Tests for the agent-plugins loader plugin: discovery, skill and command
+ * registry mounting, namespacing, project filtering, and command template
+ * injection. MCP child mounting is covered in mcp-mount.spec.ts with a
+ * static SDK mock.
+ */
+import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { Context } from '@deepseek-ai/cordis'
+import { Inbox } from '@deepseek-ai/dsh-agent'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import { Session, SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
+import SkillRegistry from '@deepseek-ai/dsh-skill'
+import CommandRuntime from '@deepseek-ai/dsh-commands'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
+
+// Isolate the global filter from the developer's real ~/.dsh: the harness
+// home resolves to a per-suite temp directory for every test.
+const { mockDshHome } = vi.hoisted(() => {
+  const home = `${process.env.TEMP ?? '/tmp'}/dsh-agent-plugins-suite-home`
+  return { mockDshHome: home }
+})
+
+vi.mock('@deepseek-ai/dsh-home-paths', () => ({
+  resolveDshHome: () => mockDshHome,
+  dshHomePath: (...segments: string[]) => join(mockDshHome, ...segments),
+}))
+
+import {
+  name as pluginName,
+  inject,
+  apply,
+  Config,
+  filterForWorkspace,
+  isPluginEnabled,
+  namespacedName,
+  NO_PROJECT_FILTER,
+  readProjectFilter,
+} from '../src/index.ts'
+
+async function tempRoot(): Promise<string> {
+  return await mkdtemp(join(tmpdir(), 'dsh-agent-plugins-loader-'))
+}
+
+async function writePlugin(root: string, name: string, files: Record<string, string>): Promise<string> {
+  const dir = join(root, name)
+  await mkdir(dir, { recursive: true })
+  for (const [relative, content] of Object.entries(files)) {
+    const file = join(dir, relative)
+    await mkdir(join(file, '..'), { recursive: true })
+    await writeFile(file, content, 'utf8')
+  }
+  return dir
+}
+
+function fakeAgent(id: string, injected: UserMessage[], cwd = process.cwd()): Agent {
+  const session = Session.create(SessionId(id), [], { version: 0, id: SessionId(id), createdAt: 0, cwd })
+  return {
+    id: SessionId(id),
+    options: {},
+    session,
+    inbox: new Inbox(session, { inserted: () => {}, discarded: () => {}, claimed: () => {} }),
+    status: 'idle',
+    ctx: new Context(),
+    cancel() {},
+    whenIdle: () => Promise.resolve(),
+    runMaintenance: <T>(task: (signal: AbortSignal) => Promise<T>) => task(new AbortController().signal),
+    send: () => {},
+    followup: () => {},
+    steer: () => {},
+    inject(message: UserMessage): void {
+      injected.push(message)
+    },
+  } as unknown as Agent
+}
+
+async function mount(
+  root: string,
+  config: Record<string, unknown> = {},
+): Promise<{ ctx: Context; agent: Agent; injected: UserMessage[] }> {
+  const ctx = new Context()
+  await ctx.plugin(SkillRegistry)
+  await ctx.plugin(CommandRuntime)
+  await ctx.plugin(AgentRegistry)
+  const injected: UserMessage[] = []
+  const agent = fakeAgent('loader-agent', injected)
+  ctx.agents.register(agent)
+  await ctx.plugin({ name: pluginName, inject, apply }, { pluginDirs: [root], ...config })
+  return { ctx, agent, injected }
+}
+
+describe('agent-plugins module exports', () => {
+  it('declares its plugin name, injections, and config schema', () => {
+    expect(pluginName).toBe('agent-plugins')
+    expect(inject).toEqual(['skills', 'commands', 'agents'])
+    expect(Config({})).toEqual({
+      pluginDirs: [join(mockDshHome, 'agent-plugins')],
+      namespaceSkills: true,
+      namespaceCommands: true,
+      projectFilter: true,
+    })
+  })
+})
+
+describe('namespacedName()', () => {
+  it('prefixes with a normalized plugin name', () => {
+    expect(namespacedName('demo-toolkit', 'apply-hotfix')).toBe('demo-toolkit-apply-hotfix')
+  })
+
+  it('normalizes non-kebab plugin names', () => {
+    expect(namespacedName('My Plugin', 'do-thing')).toBe('my-plugin-do-thing')
+  })
+})
+
+describe('isPluginEnabled()', () => {
+  it('shows everything under the empty filter', () => {
+    expect(isPluginEnabled(NO_PROJECT_FILTER, 'demo-toolkit')).toBe(true)
+  })
+
+  it('whitelists only enable-listed plugins', () => {
+    expect(isPluginEnabled({ enable: ['demo-toolkit'], disable: [] }, 'demo-toolkit')).toBe(true)
+    expect(isPluginEnabled({ enable: ['demo-toolkit'], disable: [] }, 'sample-engine')).toBe(false)
+  })
+
+  it('blacklists disable-listed plugins', () => {
+    expect(isPluginEnabled({ enable: [], disable: ['sample-engine'] }, 'sample-engine')).toBe(false)
+    expect(isPluginEnabled({ enable: [], disable: ['sample-engine'] }, 'demo-toolkit')).toBe(true)
+  })
+
+  it('explicit disable wins over the whitelist', () => {
+    expect(isPluginEnabled({ enable: ['demo-toolkit'], disable: ['demo-toolkit'] }, 'demo-toolkit')).toBe(false)
+  })
+})
+
+describe('readProjectFilter()', () => {
+  it('returns the empty parsed filter when no global filter file exists', async () => {
+    expect(await readProjectFilter()).toEqual({ global: NO_PROJECT_FILTER, workspaces: [] })
+  })
+
+  it('reads the global filter file with workspace entries from the harness home', async () => {
+    const filterFile = join(mockDshHome, 'agent-plugins.yml')
+    await mkdir(mockDshHome, { recursive: true })
+    await writeFile(filterFile, [
+      'enable:',
+      '  - example-suite',
+      '  - demo-mcp',
+      'workspaces:',
+      '  - paths:',
+      '      - D:/projects/alpha',
+      '      - E:/projects/beta',
+      '    enable:',
+      '      - demo-toolkit',
+      '  - paths:',
+      '      - E:/projects/gamma',
+      '    enable:',
+      '      - sample-engine',
+    ].join('\n'), 'utf8')
+    const filter = await readProjectFilter()
+    expect(filter.global).toEqual({ enable: ['example-suite', 'demo-mcp'], disable: [] })
+    expect(filter.workspaces).toEqual([
+      { paths: ['D:/projects/alpha', 'E:/projects/beta'], enable: ['demo-toolkit'], disable: [] },
+      { paths: ['E:/projects/gamma'], enable: ['sample-engine'], disable: [] },
+    ])
+  })
+})
+
+describe('filterForWorkspace()', () => {
+  const parsed = {
+    global: { enable: ['example-suite', 'demo-mcp'], disable: [] },
+    workspaces: [
+      { paths: ['D:/projects/alpha', 'E:/projects/beta'], enable: ['demo-toolkit'], disable: [] },
+      { paths: ['E:/projects/gamma'], enable: ['sample-engine'], disable: [] },
+    ],
+  }
+
+  it('uses the global filter alone when the cwd matches no workspace', () => {
+    expect(filterForWorkspace(parsed, 'D:/other/project')).toEqual(parsed.global)
+    expect(filterForWorkspace(parsed, undefined)).toEqual(parsed.global)
+  })
+
+  it('merges workspace enable entries onto the global whitelist', () => {
+    const filter = filterForWorkspace(parsed, 'D:/projects/alpha/Assets')
+    expect(filter.enable).toEqual(['example-suite', 'demo-mcp', 'demo-toolkit'])
+    expect(filter.disable).toEqual([])
+  })
+
+  it('matches prefix paths on path boundaries', () => {
+    const filter = filterForWorkspace(parsed, 'E:/projects/gamma/Runtime')
+    expect(filter.enable).toContain('sample-engine')
+    // A sibling path sharing a prefix string must not match.
+    expect(filterForWorkspace(parsed, 'E:/projects/gammaExtra')).toEqual(parsed.global)
+  })
+})
+
+describe('agent-plugins apply()', () => {
+  beforeEach(async () => {
+    // Fresh global-filter state per test: the suite home doubles as the
+    // harness home and must not leak filter files across cases.
+    try {
+      const { rm } = await import('node:fs/promises')
+      await rm(mockDshHome, { recursive: true, force: true })
+    } catch {
+      // Absent home is the expected pre-test state.
+    }
+  })
+
+  it('namespaces discovered skills by plugin name by default', async () => {
+    const root = await tempRoot()
+    await writePlugin(root, 'demo', {
+      'plugin.json': JSON.stringify({ name: 'demo' }),
+      'skills/apply-hotfix/SKILL.md': '---\nname: apply-hotfix\ndescription: Hotfix skill\n---\n\n# Body\n',
+    })
+    const { ctx } = await mount(root)
+    const listed = await ctx.skills.list({})
+    expect(listed.map(skill => skill.name)).toEqual(['demo-apply-hotfix'])
+    const loaded = await ctx.skills.get('demo-apply-hotfix', {})
+    expect(loaded?.content).toBe('# Body')
+  })
+
+  it('keeps bare skill names when namespaceSkills is false', async () => {
+    const root = await tempRoot()
+    await writePlugin(root, 'demo', {
+      'plugin.json': JSON.stringify({ name: 'demo' }),
+      'skills/apply-hotfix/SKILL.md': '---\nname: apply-hotfix\ndescription: Hotfix skill\n---\n\n# Body\n',
+    })
+    const { ctx } = await mount(root, { namespaceSkills: false, projectFilter: false })
+    const listed = await ctx.skills.list({})
+    expect(listed.map(skill => skill.name)).toEqual(['apply-hotfix'])
+  })
+
+  it('registers discovered commands with namespaced names and injects the rendered template', async () => {
+    const root = await tempRoot()
+    await writePlugin(root, 'demo', {
+      'plugin.json': JSON.stringify({ name: 'demo' }),
+      'commands/inspect.md': '---\ndescription: Inspect the project\nargument-hint: <target>\n---\nInspect $ARGUMENTS now.\n',
+    })
+    const { ctx, agent, injected } = await mount(root)
+    const listed = ctx.commands.list(agent)
+    expect(listed).toEqual([{ name: 'demo-inspect', description: 'Inspect the project', input: { hint: '<target>' } }])
+    const execution = await ctx.commands.execute(agent, '/demo-inspect the scene', [], new AbortController().signal)
+    expect(execution?.result).toEqual({ kind: 'success' })
+    expect(injected).toHaveLength(1)
+    const text = injected[0]?.content[0]
+    expect(text?.type).toBe('text')
+    if (text?.type === 'text') {
+      expect(text.text).toContain('<agent-plugin-command name="inspect" plugin="demo">')
+      expect(text.text).toContain('Inspect the scene now.')
+    }
+  })
+
+  it('rejects a command when the global filter disables its plugin', async () => {
+    const root = await tempRoot()
+    await writePlugin(root, 'demo', {
+      'plugin.json': JSON.stringify({ name: 'demo' }),
+      'commands/inspect.md': '---\ndescription: Inspect the project\n---\nInspect now.\n',
+    })
+    await mkdir(mockDshHome, { recursive: true })
+    await writeFile(join(mockDshHome, 'agent-plugins.yml'), 'disable:\n  - demo\n', 'utf8')
+    const { ctx, agent, injected } = await mount(root)
+    const execution = await ctx.commands.execute(agent, '/demo-inspect', [], new AbortController().signal)
+    expect(execution?.result.kind).toBe('error')
+    expect(injected).toHaveLength(0)
+  })
+
+  it('hides skills of plugins disabled by the global filter', async () => {
+    const root = await tempRoot()
+    await writePlugin(root, 'visible', {
+      'plugin.json': JSON.stringify({ name: 'visible' }),
+      'skills/keep/SKILL.md': '---\nname: keep\ndescription: Keep\n---\n',
+    })
+    await writePlugin(root, 'hidden', {
+      'plugin.json': JSON.stringify({ name: 'hidden' }),
+      'skills/drop/SKILL.md': '---\nname: drop\ndescription: Drop\n---\n',
+    })
+    await mkdir(mockDshHome, { recursive: true })
+    await writeFile(join(mockDshHome, 'agent-plugins.yml'), 'disable:\n  - hidden\n', 'utf8')
+    const { ctx } = await mount(root)
+    const listed = await ctx.skills.list({})
+    expect(listed.map(skill => skill.name)).toEqual(['visible-keep'])
+  })
+
+  it('tolerates a missing plugin root', async () => {
+    const root = join(await tempRoot(), 'absent')
+    const { ctx } = await mount(root, { projectFilter: false })
+    expect(await ctx.skills.list({})).toEqual([])
+  })
+
+  it('skips plugins that failed to load while keeping the rest', async () => {
+    const root = await tempRoot()
+    await mkdir(join(root, 'broken'), { recursive: true })
+    await writePlugin(root, 'demo', {
+      'plugin.json': JSON.stringify({ name: 'demo' }),
+      'skills/good/SKILL.md': '---\nname: good\ndescription: Good skill\n---\n',
+    })
+    const { ctx } = await mount(root, { projectFilter: false })
+    const listed = await ctx.skills.list({})
+    expect(listed.map(skill => skill.name)).toEqual(['demo-good'])
+  })
+})
