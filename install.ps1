@@ -12,14 +12,14 @@ prints the row when missing (it never edits the patch itself).
 
 .PARAMETER DshRepo
 Path to the DeepSeek Harness checkout. Defaults to
-C:\Users\shifengzhou\Documents\deepseek-harness.
+`$env:USERPROFILE\Documents\deepseek-harness`.
 
 .PARAMETER CheckOnly
 Only report what would be wired, without creating junctions.
 #>
 [CmdletBinding()]
 param(
-    [string]$DshRepo = 'C:\Users\shifengzhou\Documents\deepseek-harness',
+    [string]$DshRepo = (Join-Path $env:USERPROFILE 'Documents\deepseek-harness'),
     [switch]$CheckOnly
 )
 

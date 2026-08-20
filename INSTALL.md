@@ -4,7 +4,7 @@
 
 ## 前置条件（缺一不可，先查）
 
-1. 本机有一个 DSH 仓库 checkout（例如 `C:\Users\shifengzhou\Documents\deepseek-harness`），且**本插件目录必须能被该仓库的 pnpm workspace 看到**——`package.json` 里的 `workspace:^` 依赖只有在 DSH workspace 内才能解析。独立 clone 出来的本仓库单独 `pnpm install` 是行不通的。
+1. 本机有一个 DSH 仓库 checkout（默认路径 `%USERPROFILE%\Documents\deepseek-harness`，可用 `install.ps1 -DshRepo <路径>` 覆盖），且**本插件目录必须能被该仓库的 pnpm workspace 看到**——`package.json` 里的 `workspace:^` 依赖只有在 DSH workspace 内才能解析。独立 clone 出来的本仓库单独 `pnpm install` 是行不通的。
 2. pnpm 版本 **11.7.0**（DSH 仓库锁死；其他版本会报 version check 错误）。检查：`pnpm --version`。没有就：
    ```powershell
    corepack enable --install-directory $env:LOCALAPPDATA\corepack-shims pnpm
