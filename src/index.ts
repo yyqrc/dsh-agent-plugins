@@ -19,6 +19,13 @@
  * not implement the plugin marketplace format, remote plugin installation, or
  * the Claude Code / Codex hook surfaces.
  *
+ * With `autoUpdate` enabled (default false), each root's `installed.json`
+ * bookkeeping is refreshed before discovery: plugins whose recorded version
+ * differs from their source directory's plugin.json version are re-copied
+ * from the source, so this activation loads the fresh copies. The refresh
+ * writes only into the install root and never touches already-loaded
+ * content; every failure inside one plugin is logged and skipped.
+ *
  * @module @deepseek-ai/dsh-agent-plugins
  */
 
@@ -38,6 +45,7 @@ import type {
   SkillProviderControl,
 } from '@deepseek-ai/dsh-skill'
 import { parse as parseYaml } from 'yaml'
+import { refreshInstalledPlugins } from './auto-update.ts'
 import {
   discoverPlugins,
   type CommandManifest,
@@ -45,6 +53,8 @@ import {
   type McpServerManifest,
 } from './manifest.ts'
 
+export { INSTALLED_FILE, refreshInstalledPlugins } from './auto-update.ts'
+export type { RefreshResult } from './auto-update.ts'
 export { discoverPlugins, expandPluginRoot, loadPlugin, mcpServerName } from './manifest.ts'
 export type {
   CommandManifest,
@@ -97,6 +107,16 @@ export interface Config {
    * installed plugin.
    */
   projectFilter?: boolean
+  /**
+   * Refresh installed plugins before discovery: read each root's
+   * `installed.json` bookkeeping file, compare the recorded version with the
+   * source directory's `plugin.json` version, and re-copy plugins whose
+   * versions differ (staging replacement; failures skip the plugin with a
+   * warning). Runs before scanning, so this activation loads the fresh
+   * copies; discovery itself stays read-only. Default false — unless
+   * enabled, the loader never writes into a plugin directory.
+   */
+  autoUpdate?: boolean
 }
 
 /** Validate and default the plugin configuration. */
@@ -105,6 +125,7 @@ export const Config: z<Config> = z.object({
   namespaceSkills: z.boolean().default(true),
   namespaceCommands: z.boolean().default(true),
   projectFilter: z.boolean().default(true),
+  autoUpdate: z.boolean().default(false),
 })
 
 /** Per-project plugin selection read from the filter file. */
@@ -260,9 +281,12 @@ function parseStringList(value: unknown, path: string, field: string): readonly 
 
 /**
  * Discover the configured plugin directories and register every parsed
- * contribution. Discovery is awaited at activation so a missing or broken
- * plugin directory fails this instance loud; per-file problems inside a
- * discovered plugin are logged and skip only that file.
+ * contribution. When `autoUpdate` is enabled, each root's `installed.json`
+ * is refreshed first, so discovery reads the fresh copies; the refresh is
+ * fail-soft and never blocks a later plugin from loading. Discovery is
+ * awaited at activation so a missing or broken plugin directory fails this
+ * instance loud; per-file problems inside a discovered plugin are logged
+ * and skip only that file.
  *
  * Skills register through a cwd-sensitive provider so the per-project filter
  * applies per session. Commands check the filter inside their handlers. MCP
@@ -274,6 +298,17 @@ function parseStringList(value: unknown, path: string, field: string): readonly 
  */
 export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const roots = (config.pluginDirs ?? [DEFAULT_PLUGIN_DIR]).map(root => resolve(root))
+  if (config.autoUpdate === true) {
+    for (const root of roots) {
+      for (const result of await refreshInstalledPlugins(root)) {
+        if (result.action === 'updated') {
+          ctx.logger.info(`agent-plugins: auto-update refreshed "${result.plugin}" ${result.from ?? '?'} -> ${result.to ?? '?'}`)
+        } else if (result.action === 'skipped') {
+          ctx.logger.warn(`agent-plugins: auto-update skipped "${result.plugin}": ${result.reason ?? 'unknown reason'}`)
+        }
+      }
+    }
+  }
   const { plugins, problems } = await discoverPlugins(roots)
   for (const problem of problems) {
     ctx.logger.warn(`agent-plugins: ${problem.path}: ${problem.reason}`)
