@@ -42,15 +42,13 @@ New-Item -ItemType Junction -Path $prof -Target $cli -Force
 
 ### C. 编译（源码改动后必须做）
 
-在 **DSH 仓库根目录**执行（不是在插件目录）。把 `<本仓库路径>` 换成本仓库的绝对路径（如 `D:\dsh-agent-plugins`）：
+在本仓库目录直接跑一键脚本（它会镜像到 DSH 编译锚点，在 DSH 仓库根完成 tsc/tsdown/vitest/oxlint/constraints，再把 lib 拷回本仓库）：
 
 ```powershell
-pnpm install --offline --prefer-offline        # 首次，注册 workspace 依赖
-pnpm exec tsc --build <本仓库路径>\tsconfig.json
-pnpm exec tsdown --env.DSH_BUILD_FACE host     # 重新生成 <本仓库路径>\lib\index.js（运行中的 DSH 读的是 lib）
+powershell -File <本仓库路径>\sync-to-dsh.ps1
 ```
 
-> 本仓库的 `package.json` 用 `workspace:^` 依赖，只有 DSH 仓库的 pnpm workspace 能解析；junction 已让 DSH workspace 通过 `apps\cli\node_modules` 看到本仓库，所以 tsc/tsdown 直接指向本仓库路径即可。
+> 为什么不能直接 `tsc --build <本仓库路径>\tsconfig.json`：本仓库 `tsconfig.json` 的 `references` 是按 DSH 仓库内 `packages\extensions\agent-plugins` 的位置写的相对路径，独立路径下解析不到（junction 只影响运行时 node_modules 解析，不影响 tsc 的相对路径）。分步等价命令见 `AGENTS.md` 的「迭代工作流」。
 
 ### D. 重启 DSH 验证
 
@@ -74,23 +72,39 @@ pnpm exec tsdown --env.DSH_BUILD_FACE host     # 重新生成 <本仓库路径>\
 
 ## 验证清单（装完 / 改完都要过）
 
+`sync-to-dsh.ps1` 已内置全部步骤；要手动分步复跑（在 DSH 仓库根目录，锚点已镜像的前提下）：
+
 ```powershell
-pnpm exec tsc --build <本仓库路径>\tsconfig.json
-pnpm exec vitest run <本仓库路径>\tests
-pnpm exec oxlint <本仓库路径>
+pnpm exec tsc --build packages/extensions/agent-plugins/tsconfig.json
+pnpm exec vitest run packages/extensions/agent-plugins/tests
+pnpm exec oxlint packages/extensions/agent-plugins
 pnpm run constraints
 ```
 
-三条全绿才叫"编译/测试通过"；运行态验证（技能目录出现、MCP 工具出现）需要重启 DSH 后看会话。
+全绿后把锚点 `lib\*` 拷回本仓库 `lib\`（sync 脚本第 3 步）。三条全绿才叫"编译/测试通过"；运行态验证（技能目录出现、MCP 工具出现）需要重启 DSH 后看会话。
 
 ## 迭代工作流（改了代码之后）
 
 1. 在本仓库改 `src/` / `tests/`；
-2. 在 DSH 仓库根目录跑上面的验证清单 + `pnpm exec tsdown --env.DSH_BUILD_FACE host` 重建 lib；
+2. 跑 `powershell -File <本仓库路径>\sync-to-dsh.ps1`（镜像 + 编译 + 测试 + lint + constraints + lib 回拷）；
 3. 重启 DSH，检查活跃会话技能目录符合全局过滤（`~/.dsh/agent-plugins.yml`）；
 4. 全绿后在本仓库 `git add`（只加改动文件，`lib/` 被 ignore）→ commit → push。
 
 详见 `AGENTS.md` 的「迭代工作流」——AI 接手时会先读那份。
+
+## 可选：启动时自动更新已装插件
+
+在 profile patch（`~/.dsh/profiles/web/cordis.patch.yml`）的 agent-plugins 行上加 `config.autoUpdate: true`：
+
+```yaml
+- insert:
+    - id: agent-plugins
+      name: '@deepseek-ai/dsh-agent-plugins'
+      config:
+        autoUpdate: true
+```
+
+开启后每次 DSH 启动会在扫描前读 `~/.dsh/agent-plugins/installed.json`，对比每个记录的 `source` 目录 `plugin.json` 版本与记录版本，不等就整目录重拷（排除 `.git`/`node_modules` 等）并回写记录；本次启动即加载新版本。任何失败只告警并跳过该插件，不影响启动。验证：把某个源目录的 `plugin.json` 版本号改大，重启 DSH，看日志出现 `auto-update refreshed "<name>" <old> -> <new>` 且 `installed.json` 的版本已更新。
 
 ## 常见误操作（别人踩过的坑）
 

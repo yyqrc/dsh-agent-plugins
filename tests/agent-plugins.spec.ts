@@ -5,7 +5,7 @@
  * static SDK mock.
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest'
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { Context } from '@deepseek-ai/cordis'
@@ -39,6 +39,7 @@ import {
   NO_PROJECT_FILTER,
   readProjectFilter,
 } from '../src/index.ts'
+import { INSTALLED_FILE } from '../src/auto-update.ts'
 
 async function tempRoot(): Promise<string> {
   return await mkdtemp(join(tmpdir(), 'dsh-agent-plugins-loader-'))
@@ -53,6 +54,17 @@ async function writePlugin(root: string, name: string, files: Record<string, str
     await writeFile(file, content, 'utf8')
   }
   return dir
+}
+
+/** Names only, for skill-list assertions. */
+function listedSkillNames(skills: readonly { name: string }[]): string[] {
+  return skills.map(skill => skill.name)
+}
+
+/** The version field of one installed plugin.json. */
+async function readManifestVersion(pluginDir: string): Promise<string | undefined> {
+  const manifest = JSON.parse(await readFile(join(pluginDir, 'plugin.json'), 'utf8')) as { version?: string }
+  return manifest.version
 }
 
 function fakeAgent(id: string, injected: UserMessage[], cwd = process.cwd()): Agent {
@@ -100,6 +112,7 @@ describe('agent-plugins module exports', () => {
       namespaceSkills: true,
       namespaceCommands: true,
       projectFilter: true,
+      autoUpdate: false,
     })
   })
 })
@@ -297,5 +310,52 @@ describe('agent-plugins apply()', () => {
     const { ctx } = await mount(root, { projectFilter: false })
     const listed = await ctx.skills.list({})
     expect(listed.map(skill => skill.name)).toEqual(['demo-good'])
+  })
+
+  it('never refreshes installed plugins when autoUpdate is unset', async () => {
+    const root = await tempRoot()
+    const source = join(root, 'source', 'demo')
+    await mkdir(source, { recursive: true })
+    await writeFile(join(source, 'plugin.json'), JSON.stringify({ name: 'demo', version: '2.0.0' }), 'utf8')
+    await mkdir(join(source, 'skills', 'new-skill'), { recursive: true })
+    await writeFile(join(source, 'skills', 'new-skill', 'SKILL.md'), '---\nname: new-skill\ndescription: New\n---\n', 'utf8')
+    const install = join(root, 'install')
+    await writePlugin(install, 'demo', {
+      'plugin.json': JSON.stringify({ name: 'demo', version: '1.0.0' }),
+      'skills/old-skill/SKILL.md': '---\nname: old-skill\ndescription: Old\n---\n',
+    })
+    const recordBefore = JSON.stringify({ demo: { source, version: '1.0.0', installedAt: '2020-01-01 00:00:00' } })
+    await writeFile(join(install, INSTALLED_FILE), recordBefore, 'utf8')
+    const { ctx } = await mount(install, { projectFilter: false })
+    // Default config leaves the installed directory and record untouched.
+    expect(listedSkillNames(await ctx.skills.list({}))).toEqual(['demo-old-skill'])
+    expect(await readManifestVersion(join(install, 'demo'))).toBe('1.0.0')
+    expect(await readFile(join(install, INSTALLED_FILE), 'utf8')).toBe(recordBefore)
+  })
+
+  it('refreshes installed plugins before discovery when autoUpdate is enabled', async () => {
+    const root = await tempRoot()
+    const source = join(root, 'source', 'demo')
+    await mkdir(source, { recursive: true })
+    await writeFile(join(source, 'plugin.json'), JSON.stringify({ name: 'demo', version: '2.0.0' }), 'utf8')
+    await mkdir(join(source, 'skills', 'new-skill'), { recursive: true })
+    await writeFile(join(source, 'skills', 'new-skill', 'SKILL.md'), '---\nname: new-skill\ndescription: New\n---\n', 'utf8')
+    const install = join(root, 'install')
+    await writePlugin(install, 'demo', {
+      'plugin.json': JSON.stringify({ name: 'demo', version: '1.0.0' }),
+      'skills/old-skill/SKILL.md': '---\nname: old-skill\ndescription: Old\n---\n',
+    })
+    await writeFile(join(install, INSTALLED_FILE), JSON.stringify({
+      demo: { source, version: '1.0.0', installedAt: '2020-01-01 00:00:00' },
+    }), 'utf8')
+    const { ctx } = await mount(install, { projectFilter: false, autoUpdate: true })
+    // The refreshed tree is what this activation loads.
+    expect(listedSkillNames(await ctx.skills.list({}))).toEqual(['demo-new-skill'])
+    expect(await readManifestVersion(join(install, 'demo'))).toBe('2.0.0')
+    const record = JSON.parse(await readFile(join(install, INSTALLED_FILE), 'utf8')) as {
+      demo: { version?: string; installedAt?: string }
+    }
+    expect(record.demo.version).toBe('2.0.0')
+    expect(record.demo.installedAt).not.toBe('2020-01-01 00:00:00')
   })
 })
