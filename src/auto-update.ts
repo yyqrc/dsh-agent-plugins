@@ -134,7 +134,7 @@ export async function refreshInstalledPlugins(root: string): Promise<readonly Re
  * @returns the outcome for this entry.
  */
 async function refreshOne(root: string, name: string, rawEntry: unknown): Promise<RefreshResult> {
-  if (name === '' || name === '.' || name === '..' || name.includes('/') || name.includes('\\')) {
+  if (!isPlainName(name)) {
     return { plugin: name, action: 'skipped', reason: 'record key is not a plain directory name' }
   }
   const entry = isObject(rawEntry) ? rawEntry : {}
@@ -171,17 +171,42 @@ async function refreshOne(root: string, name: string, rawEntry: unknown): Promis
   }
   // Staging keeps the previous install intact until the new tree is fully
   // copied: a failed refresh must never destroy a working plugin.
-  const staging = `${destination}.refresh-${process.pid}`
   try {
-    await rm(staging, { recursive: true, force: true })
+    await stageReplace(source, destination)
+  } catch (error) {
+    return { plugin: name, action: 'skipped', reason: `refresh copy failed: ${String(error)}` }
+  }
+  return { plugin: name, action: 'updated', from: installedVersion, to: version }
+}
+
+/**
+ * Whether a record key is a safe plain directory name for the install root.
+ * Shared with the marketplace sync, which installs under the same root.
+ */
+export function isPlainName(name: string): boolean {
+  return name !== '' && name !== '.' && name !== '..' && !name.includes('/') && !name.includes('\\')
+}
+
+/**
+ * Copy one directory tree into a fresh staging directory and rename it into
+ * place, so the destination swaps atomically and a failed copy never
+ * destroys the previous contents. Excluded names (`.git`, `.temp`,
+ * `__pycache__`, `node_modules`, `installed.json`, `*.pyc`) are stripped from
+ * the copy at every level.
+ * @param source - absolute source directory.
+ * @param destination - absolute destination directory.
+ */
+export async function stageReplace(source: string, destination: string): Promise<void> {
+  const staging = `${destination}.refresh-${process.pid}`
+  await rm(staging, { recursive: true, force: true })
+  try {
     await copyDirectory(source, staging)
     await rm(destination, { recursive: true, force: true })
     await rename(staging, destination)
   } catch (error) {
     await rm(staging, { recursive: true, force: true })
-    return { plugin: name, action: 'skipped', reason: `refresh copy failed: ${String(error)}` }
+    throw error
   }
-  return { plugin: name, action: 'updated', from: installedVersion, to: version }
 }
 
 /**
@@ -262,7 +287,7 @@ function samePath(left: string, right: string): boolean {
 }
 
 /** Timestamp in the installer's local `yyyy-MM-dd HH:mm:ss` format. */
-function formatTimestamp(date: Date): string {
+export function formatTimestamp(date: Date): string {
   const pad = (value: number): string => String(value).padStart(2, '0')
   return [
     [date.getFullYear(), date.getMonth() + 1, date.getDate()].map(pad).join('-'),

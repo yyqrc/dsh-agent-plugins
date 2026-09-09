@@ -64,6 +64,13 @@ async function readRecord(install: string): Promise<Record<string, RecordEntry>>
   return JSON.parse(await readFile(join(install, INSTALLED_FILE), 'utf8')) as Record<string, RecordEntry>
 }
 
+/** Read the required demo entry from the rewritten installed.json fixture. */
+async function readDemoRecord(install: string): Promise<RecordEntry> {
+  const entry = (await readRecord(install)).demo
+  if (entry === undefined) throw new Error('expected installed.json to contain the demo record')
+  return entry
+}
+
 /** Read one installed/source plugin.json manifest. */
 async function readManifest(pluginDir: string): Promise<{ name?: string; version?: string }> {
   return JSON.parse(await readFile(join(pluginDir, 'plugin.json'), 'utf8')) as { name?: string; version?: string }
@@ -178,11 +185,11 @@ describe('refreshInstalledPlugins()', () => {
     expect(await readFile(join(install, 'demo', 'skills', 'new', 'SKILL.md'), 'utf8')).toContain('name: new')
     expect(await entryNames(join(install, 'demo'))).toContain('stale-gone.txt')
     // The record carries the new version, a fresh installedAt, and unknown fields.
-    const record = await readRecord(install)
-    expect(record.demo.version).toBe('2.0.0')
-    expect(record.demo.source).toBe(source)
-    expect(record.demo.note).toBe('preserve me')
-    expect(record.demo.installedAt).not.toBe('2020-01-01 00:00:00')
+    const record = await readDemoRecord(install)
+    expect(record.version).toBe('2.0.0')
+    expect(record.source).toBe(source)
+    expect(record.note).toBe('preserve me')
+    expect(record.installedAt).not.toBe('2020-01-01 00:00:00')
   })
 
   it('treats a missing record version as outdated', async () => {
@@ -191,8 +198,8 @@ describe('refreshInstalledPlugins()', () => {
     const results = await refreshInstalledPlugins(install)
     expect(results[0]?.action).toBe('updated')
     expect(results[0]?.from).toBeUndefined()
-    const record = await readRecord(install)
-    expect(record.demo.version).toBe('2.0.0')
+    const record = await readDemoRecord(install)
+    expect(record.version).toBe('2.0.0')
   })
 
   it('strips excluded names and bytecode from the copied tree', async () => {
@@ -238,7 +245,7 @@ describe('refreshInstalledPlugins()', () => {
     // No staging directory is left behind.
     expect((await entryNames(install)).join('\n')).not.toContain('.refresh-')
     // The record was not rewritten.
-    expect((await readRecord(install)).demo.version).toBe('1.0.0')
+    expect((await readDemoRecord(install)).version).toBe('1.0.0')
   })
 
   it('skips a record whose source equals the install directory', async () => {

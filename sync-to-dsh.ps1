@@ -80,8 +80,17 @@ if ($LASTEXITCODE -ne 0) { throw 'constraints failed' }
 }
 
 # 3. Copy the fresh lib back into the standalone repo (runtime reads it there
-#    through the profile junction chain).
-Copy-Item "$Target\lib" (Join-Path $Source 'lib') -Recurse -Force
+#    through the profile junction chain). The destination is replaced whole:
+#    Copy-Item -Recurse into an existing directory nests the source under it
+#    (lib\lib\...) and leaves stale top-level files, so remove first.
+$StandaloneLib = Join-Path $Source 'lib'
+if (Test-Path $StandaloneLib) {
+    Remove-Item $StandaloneLib -Recurse -Force
+}
+Copy-Item "$Target\lib" $StandaloneLib -Recurse -Force
+if (-not (Test-Path (Join-Path $StandaloneLib 'index.js'))) {
+    throw "lib copy failed: no index.js at $StandaloneLib"
+}
 Write-Host "[sync] copied rebuilt lib -> standalone repo"
 
 Write-Host ""

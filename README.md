@@ -4,7 +4,7 @@ Agent Plugins 1.0 compatibility layer.
 
 Discovers agent-plugins.org plugin directories under the configured roots and mounts each plugin's contributions on the harness registries: skills from the plugin's `skills` directory register on `ctx.skills`, slash commands from the plugin's `commands` directory register on `ctx.commands`, and MCP servers from `mcp.json` mount as `dsh-mcp-client` instances whose tools surface under the `mcp__<serverName>__<tool>` namespace.
 
-This package is a compatibility bridge for directory-form plugins. It does not implement the plugin marketplace format, remote plugin installation, or the Claude Code / Codex hook surfaces.
+This package is a compatibility bridge for directory-form plugins. It does not implement the Claude Code / Codex hook surfaces, and its source declaration support is opt-in directory sync (see Source declarations) rather than a remote installer with version pinning.
 
 ## Plugin
 
@@ -19,6 +19,7 @@ Requires `ctx.skills`, `ctx.commands`, and `ctx.agents` (`inject: ['skills', 'co
 | `namespaceCommands` | `true` | Prefix command names the same way (`<plugin>-<command>`). |
 | `projectFilter` | `true` | Honor the global filter file at `<dsh home>/agent-plugins.yml` (see Plugin filter). |
 | `autoUpdate` | `false` | Before discovery, refresh each root's plugins recorded in its `installed.json`: when the source directory's `plugin.json` version differs from the record, re-copy the source tree into the install root and rewrite the record (see Auto-refresh). |
+| `sourcesFile` | `<dsh home>/agent-plugins/sources.yml` | Before discovery, sync the plugins declared in this DSH-side `sources.yml` file: each entry maps a plugin name to its source (absolute path, path relative to the file, or git URL) and is copied into `pluginDirs[0]`, refreshing only entries whose `plugin.json` version differs from the `installed.json` record. Git sources are fetched to the remote's default branch tip (no version pinning). Set to `false` to disable declaration sync entirely — then the loader never runs git or touches the network (see Source declarations). |
 
 ### Plugin filter
 
@@ -75,6 +76,38 @@ Records require an absolute `source` path and a plain directory name as key; any
         autoUpdate: true
 ```
 
+### Source declarations
+
+With `sourcesFile` set (the default `<dsh home>/agent-plugins/sources.yml`), activation syncs the plugins declared in that file before scanning them. The declaration file is the DSH-side installation decision — it does not depend on any marketplace manifest:
+
+```yaml
+# <dsh home>/agent-plugins/sources.yml
+plugins:
+  demo-toolkit:
+    source: D:/plugin-sources/demo-toolkit   # absolute path
+  sample-engine:
+    source: ./market-plugins/sample-engine        # path relative to this file
+  demo-mcp:
+    # git URL; several plugins can share one repository via #subpath
+    source: git+https://git.example.com/team/plugin-sources.git#demo_mcp
+  example-suite:
+    # source omitted: keep the installed record's source
+```
+
+For each declared entry, the source's `plugin.json` `version` is compared with the `installed.json` record by string equality; only a difference re-copies the tree (through the same staging replacement) and rewrites the record, with the source kept as `source`. A declared source may be an absolute path, a path relative to the declaration file, or a git URL (`git+https://...` / `git@...`) — git sources are fetched to the remote's default branch tip (no version pinning), cloned into a cache under the install root (`.marketplace-git/`) on first sync and fetched thereafter. A `#subpath` suffix (as in `git+<url>#<subdir>`) selects a subdirectory inside the repository as the plugin root, so several plugins can share one marketplace repository (a single clone per repository URL is cached). Entries without a `source` keep the installed record's source (declaration-only, so a plugin stays managed without re-pointing it).
+
+Because the sync runs before discovery, the same activation loads the fresh copies. Every failure (unreadable declaration, git failure, missing version, copy error) skips that plugin with a warning and leaves the previous install intact. Enable it through the profile patch (or rely on the default):
+
+```yaml
+- insert:
+    - id: agent-plugins
+      name: '@deepseek-ai/dsh-agent-plugins'
+      config:
+        sourcesFile: C:/Users/<you>/.dsh/agent-plugins/sources.yml
+```
+
+Set `sourcesFile: false` to disable declaration sync entirely — then the loader never reads a declaration file, runs git, or touches the network, and behaves exactly as before.
+
 ## Discovery
 
 Each configured root is scanned one level deep for directories containing a `plugin.json`. Within one plugin directory:
@@ -87,6 +120,10 @@ Each configured root is scanned one level deep for directories containing a `plu
 Per-file problems (malformed frontmatter, invalid names, unsupported transport types) are logged and skip only that file; a plugin that fails its `plugin.json` is skipped whole. Duplicate plugin names resolve to the earliest root; duplicate normalized MCP server names skip later servers with a warning.
 
 MCP child instances are awaited during this plugin's activation, so the loader reports a failed initial connection as a warning and leaves the rest of the plugin mounted.
+
+## Standalone checkout wiring
+
+The standalone source repository remains the runtime package target when it is junctioned into a source checkout. Its `node_modules` must also junction to `packages/extensions/agent-plugins/node_modules` in that DeepSeek Harness checkout, because Node resolves ESM dependencies from the standalone repository's real path. Run the standalone repository's `install.ps1` after `pnpm install` in DeepSeek Harness to create and verify all three junctions; the script does not edit the profile patch.
 
 ## Model Experience
 
@@ -120,10 +157,10 @@ Append-only: each invocation appends one instruction message to the request hist
 
 ## Known Limitations and Deferred Work
 
-- **No marketplace or remote installation** — only local plugin directories are discovered; `marketplace.json`, remote plugin fetching, version pinning, and enable/disable per plugin are not implemented.
+- **Source declaration sync is opt-in, unclocked, and without version pinning** — it reads only the DSH-side `sourcesFile` (default `<dsh home>/agent-plugins/sources.yml`; disable with `false`), fetches git sources to the remote's default branch tip with no tag/commit pinning, runs once per activation with no cross-process lock, and skips a failing plugin instead of blocking startup. Enable/disable per plugin remains the job of the `agent-plugins.yml` filter.
 - **No live re-discovery** — the configured roots are scanned once at plugin activation; adding or editing a plugin requires a plugin reload.
 - **No hook or agent-file support** — the Agent Plugins hook and agent surfaces (and the Claude Code / Codex hook dialects) are not mapped; commands are the only executable contribution besides skills and MCP tools.
 - **Command rendering is a literal template substitution** — `$ARGUMENTS` is replaced verbatim without shell quoting, and no structured-argument schema from the manifest is honored.
 - **Normalized MCP server names can collide** — later colliding servers are skipped with a warning instead of being renamed.
-- **Auto-refresh is bookkeeping-file driven and unclocked** — it reads only local `installed.json` records (no `marketplace.json`, no remote sources), runs once per activation with no cross-process lock, so concurrent DSH starts on the same root race with last-writer-wins on full snapshots; a running session keeps the version it loaded until the next activation.
+- **Auto-refresh is bookkeeping-file driven and unclocked** — it reads only local `installed.json` records, runs once per activation with no cross-process lock, so concurrent DSH starts on the same root race with last-writer-wins on full snapshots; a running session keeps the version it loaded until the next activation.
 - **Refreshed plugins still need an activation boundary** — the refresh happens before discovery, so new versions load on the next DSH restart or plugin reload; a long-running process never re-reads its plugin directories.

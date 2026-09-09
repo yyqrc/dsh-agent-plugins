@@ -6,9 +6,10 @@
 
 - **本仓库（独立仓库）是源码权威**。DSH 运行时通过 junction 链读本仓库的 `lib/`：
   `<dsh home>\profiles\node_modules\@deepseek-ai\dsh-agent-plugins` → DSH 仓库 `apps\cli\node_modules\@deepseek-ai\dsh-agent-plugins` → 本仓库。
+- Node 会按 junction 的真实路径从本仓库解析 ESM 依赖，因此本仓库的 `node_modules` 必须 junction 到 DSH 编译锚点的 `node_modules`；`install.ps1` 负责创建并验证这条依赖链。
 - 不要改 DSH 仓库里那份 `packages\extensions\agent-plugins\`（那是历史遗留，junction 已不指向它；改它不会影响运行中的 DSH）
   但注意：`sync-to-dsh.ps1` 会把本仓库镜像进去当**编译锚点**（见「迭代工作流」），所以**锚点内的文件只能由镜像写入，不要手工编辑**——手工改动会被下一次 sync 覆盖，且不进本仓库 git。
-- 本仓库的 `package.json` 用 `workspace:^` 依赖，**编译必须在 DSH 仓库 workspace 内完成**；本仓库不能独立 `pnpm install`。
+- 本仓库的 `package.json` 用 `workspace:^` 依赖，**编译和依赖安装必须在 DSH 仓库 workspace 内完成**；本仓库不能独立 `pnpm install`，运行时只复用编译锚点已经安装的依赖。
 - `lib/` 是构建产物，本仓库 gitignore 不提交；但**运行中的 DSH 只认 `lib/`**——改了源码不重建 lib 等于没改。
 
 ## 迭代工作流（每次改动后必须按顺序做完）
@@ -58,7 +59,7 @@ pnpm exec tsx scripts/verify-agent-note-format.ts
 
 ## 这个插件不是什么（禁止改偏的边界）
 
-- 不是插件市场、不是远程安装器：只扫描本地目录（`Config.pluginDirs`，默认 `<dsh home>/agent-plugins`），不读 `marketplace.json`，不做远程安装与版本管理。
+- 不是插件市场、不是远程安装器：默认只扫描本地目录（`Config.pluginDirs`，默认 `<dsh home>/agent-plugins`），不读任何市场清单，不做远程安装与版本管理。唯一例外：`sourcesFile`（默认 `<dsh home>/agent-plugins/sources.yml`，`false` 禁用）存在时，激活前按该 DSH 侧声明文件的 `plugins` map（name → source：本地绝对路径/相对声明文件的路径/git URL，`git+<url>#<子路径>` 选择仓库内子目录作插件根）把插件同步进安装根（git 源 fetch 到远端默认分支最新，无版本 pin）；同步先于扫描加载，加载阶段仍只读。
 - 不是 Claude Code / Codex 插件系统兼容层：**不读** `.claude-plugin/`、`.codex-plugin/`、`.codebuddy-plugin/`、`hooks.json`、`AGENTS.md` 代理文件。这些属于其他包（如 `hooks-claude-code`）的职责，不要合并进来。
 - 不实现 Agent Plugins 1.0 的 `agents/`、`hooks/` 目录面——只消费 skills、commands、MCP 三样。
 - 不写插件目录本身：loader 只读插件文件，**绝不修改已加载的插件**。唯一例外：`autoUpdate` 显式开启（默认关）时，激活前按各根目录 `installed.json` 记录刷新插件目录（版本字符串不等即整目录重拷 + 回写记录）；刷新先于扫描加载，加载阶段仍只读。
@@ -82,5 +83,6 @@ pnpm exec tsx scripts/verify-agent-note-format.ts
 - `agent-plugins.spec.ts`：命名空间（开/关）、`isPluginEnabled` 语义、全局过滤文件解析、`filterForWorkspace` 前缀合并、命令注入、被禁用插件的技能隐藏与命令报错。
 - `mcp-mount.spec.ts`：MCP 子插件挂载、config 传递、重名跳过。
 - `auto-update.spec.ts`：installed.json 缺失/坏 JSON/非对象跳过、记录 key 与 source 校验（相对路径、缺 plugin.json、无版本）、版本相同不动文件、版本不同重拷+回写（未知字段保留）、排除名单剥离、拷贝失败旧安装完好且无 staging 残留、`autoUpdate` 默认关零写入、开启后本次激活即加载新版本（集成在 agent-plugins.spec.ts）。
+- `marketplace.spec.ts`：声明文件缺失/坏 YAML fail-soft、坏条目跳过且不拖垮其余条目、相对/绝对/git 三种 source、git 源真实 clone/fetch（file:// 本地仓库）、版本相同不重拷、版本不同重拷+回写、git 失败（clone/fetch 失败）跳过且旧安装完好、排除名单剥离、拷贝深度超限旧安装完好、省略 source 保留 installed.json 记录源（apply 层在 agent-plugins.spec.ts 的 mount 显式传 `sourcesFile: false` 隔离）。
 
 新增行为 = 新增测试，不要在已有用例上凑合。

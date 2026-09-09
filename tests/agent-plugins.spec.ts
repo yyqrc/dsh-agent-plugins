@@ -99,7 +99,11 @@ async function mount(
   const injected: UserMessage[] = []
   const agent = fakeAgent('loader-agent', injected)
   ctx.agents.register(agent)
-  await ctx.plugin({ name: pluginName, inject, apply }, { pluginDirs: [root], ...config })
+  await ctx.plugin({ name: pluginName, inject, apply }, {
+    pluginDirs: [root],
+    sourcesFile: false,
+    ...config,
+  })
   return { ctx, agent, injected }
 }
 
@@ -113,6 +117,7 @@ describe('agent-plugins module exports', () => {
       namespaceCommands: true,
       projectFilter: true,
       autoUpdate: false,
+      sourcesFile: join(mockDshHome, 'agent-plugins', 'sources.yml'),
     })
   })
 })

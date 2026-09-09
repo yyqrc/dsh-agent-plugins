@@ -46,6 +46,7 @@ import type {
 } from '@deepseek-ai/dsh-skill'
 import { parse as parseYaml } from 'yaml'
 import { refreshInstalledPlugins } from './auto-update.ts'
+import { syncDeclaredSources } from './marketplace.ts'
 import {
   discoverPlugins,
   type CommandManifest,
@@ -55,6 +56,8 @@ import {
 
 export { INSTALLED_FILE, refreshInstalledPlugins } from './auto-update.ts'
 export type { RefreshResult } from './auto-update.ts'
+export { syncDeclaredSources } from './marketplace.ts'
+export type { DeclaredSource, MarketplaceResult } from './marketplace.ts'
 export { discoverPlugins, expandPluginRoot, loadPlugin, mcpServerName } from './manifest.ts'
 export type {
   CommandManifest,
@@ -117,6 +120,16 @@ export interface Config {
    * enabled, the loader never writes into a plugin directory.
    */
   autoUpdate?: boolean
+  /**
+   * Sync plugins declared in a DSH-side `sources.yml` file before discovery.
+   * The file maps plugin names to their sources (absolute path, path
+   * relative to the file, or git URL) and is the DSH-side installation
+   * decision; it does not depend on any marketplace manifest. Defaults to
+   * `<dsh home>/agent-plugins/sources.yml`. Disable with `false` — unless
+   * enabled, the loader never syncs from declarations, runs git, or touches
+   * the network.
+   */
+  sourcesFile?: string | false
 }
 
 /** Validate and default the plugin configuration. */
@@ -126,6 +139,7 @@ export const Config: z<Config> = z.object({
   namespaceCommands: z.boolean().default(true),
   projectFilter: z.boolean().default(true),
   autoUpdate: z.boolean().default(false),
+  sourcesFile: z.union([z.string(), z.const(false)]).default(join(DEFAULT_PLUGIN_DIR, 'sources.yml')),
 })
 
 /** Per-project plugin selection read from the filter file. */
@@ -306,6 +320,17 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         } else if (result.action === 'skipped') {
           ctx.logger.warn(`agent-plugins: auto-update skipped "${result.plugin}": ${result.reason ?? 'unknown reason'}`)
         }
+      }
+    }
+  }
+  const sourcesFile = config.sourcesFile
+  if (typeof sourcesFile === 'string' && sourcesFile.trim() !== '') {
+    const installRoot = roots[0] ?? DEFAULT_PLUGIN_DIR
+    for (const result of await syncDeclaredSources(resolve(sourcesFile), installRoot)) {
+      if (result.action === 'installed' || result.action === 'updated') {
+        ctx.logger.info(`agent-plugins: sources sync ${result.action} "${result.plugin}" ${result.from ?? '?'} -> ${result.to ?? '?'}`)
+      } else if (result.action === 'skipped') {
+        ctx.logger.warn(`agent-plugins: sources sync skipped "${result.plugin}": ${result.reason ?? 'unknown reason'}`)
       }
     }
   }

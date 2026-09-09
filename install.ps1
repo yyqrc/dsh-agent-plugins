@@ -4,11 +4,11 @@
 Wire the agent-plugins loader into a local DeepSeek Harness checkout.
 
 .DESCRIPTION
-The loader package is a workspace package inside the DeepSeek Harness repo;
-this script junctions it into the two resolution points a source-run DSH
-reads: the repo's apps/cli/node_modules tree and the user profile's
-node_modules tree. It also verifies the profile patch has the loader row and
-prints the row when missing (it never edits the patch itself).
+The standalone repository owns the loader source and built lib. This script
+junctions its node_modules to the package's DeepSeek Harness workspace anchor,
+then junctions the repository into the two resolution points a source-run DSH
+reads. It also verifies the profile patch has the loader row and prints the row
+when missing (it never edits the patch itself).
 
 .PARAMETER DshRepo
 Path to the DeepSeek Harness checkout. Defaults to
@@ -27,6 +27,8 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $PluginDir = $PSScriptRoot
+$DependencyTarget = Join-Path $DshRepo 'packages\extensions\agent-plugins\node_modules'
+$DependencyLink = Join-Path $PluginDir 'node_modules'
 $CliLink = Join-Path $DshRepo 'apps\cli\node_modules\@deepseek-ai\dsh-agent-plugins'
 $ProfileLink = Join-Path $env:USERPROFILE '.dsh\profiles\node_modules\@deepseek-ai\dsh-agent-plugins'
 $ProfilePatch = Join-Path $env:USERPROFILE '.dsh\profiles\web\cordis.patch.yml'
@@ -42,7 +44,24 @@ Write-Host "plugin dir : $PluginDir"
 Write-Host "dsh repo   : $DshRepo"
 Write-Host ""
 
-# 1. Repo-side junction.
+# 1. Runtime dependencies. Node resolves ESM dependencies from the standalone
+#    repository's real path after traversing the package junctions.
+if (-not (Test-Path $DependencyTarget)) {
+    throw "DSH workspace dependencies are missing: $DependencyTarget. Run pnpm install in $DshRepo first."
+}
+$dependenciesOk = Test-LinkTarget $DependencyLink $DependencyTarget
+if ($dependenciesOk) {
+    Write-Host "[OK] $DependencyLink already links to the DSH workspace package dependencies."
+} elseif ($CheckOnly) {
+    Write-Host "[MISSING] would create junction: $DependencyLink -> $DependencyTarget"
+} elseif (Test-Path $DependencyLink) {
+    throw "Refusing to replace existing dependency path: $DependencyLink"
+} else {
+    New-Item -ItemType Junction -Path $DependencyLink -Target $DependencyTarget | Out-Null
+    Write-Host "[DONE] junction created: $DependencyLink -> $DependencyTarget"
+}
+
+# 2. Repo-side junction.
 $repoOk = Test-LinkTarget $CliLink $PluginDir
 if ($repoOk) {
     Write-Host "[OK] $CliLink already links to the plugin dir."
@@ -55,7 +74,7 @@ if ($repoOk) {
     Write-Host "[DONE] junction created: $CliLink -> $PluginDir"
 }
 
-# 2. Profile-side junction (points at the repo-side link, mirroring how
+# 3. Profile-side junction (points at the repo-side link, mirroring how
 #    existing profile packages chain to apps/cli/node_modules).
 $profileOk = Test-LinkTarget $ProfileLink $CliLink
 if ($profileOk) {
@@ -69,7 +88,7 @@ if ($profileOk) {
     Write-Host "[DONE] junction created: $ProfileLink -> $CliLink"
 }
 
-# 3. Profile patch row.
+# 4. Profile patch row.
 Write-Host ""
 if (Test-Path $ProfilePatch) {
     $hasRow = Select-String -Path $ProfilePatch -Pattern "dsh-agent-plugins" -SimpleMatch -Quiet
@@ -87,7 +106,7 @@ if (Test-Path $ProfilePatch) {
     Write-Host "         Create it with the loader row (see INSTALL.md)."
 }
 
-# 4. Build reminder.
+# 5. Build reminder.
 Write-Host ""
 $libExists = Test-Path (Join-Path $PluginDir 'lib\index.js')
 if ($libExists) {
