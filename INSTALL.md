@@ -118,9 +118,9 @@ pnpm run constraints
 # ~/.dsh/agent-plugins/sources.yml —— DSH 侧安装声明，不依赖任何市场清单
 plugins:
   demo-toolkit:
-    source: D:/plugin-sources/demo-toolkit     # 本地绝对路径
+    source: D:/plugin-sources/demo-toolkit      # 本地绝对路径
   sample-engine:
-    source: ./market/plugins/sample-engine          # 相对本文件的路径
+    source: ./market/plugins/sample-engine       # 相对本文件的路径
   demo-mcp:
     # git URL；#子路径 选择仓库内子目录作为插件根（多插件共享一个仓库）
     source: git+https://git.example.com/team/plugin-sources.git#demo_mcp

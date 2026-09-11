@@ -208,7 +208,7 @@ describe('filterForWorkspace()', () => {
     const filter = filterForWorkspace(parsed, 'E:/projects/gamma/Runtime')
     expect(filter.enable).toContain('sample-engine')
     // A sibling path sharing a prefix string must not match.
-    expect(filterForWorkspace(parsed, 'E:/projects/gammaExtra')).toEqual(parsed.global)
+    expect(filterForWorkspace(parsed, 'E:/projects/gamma-extra')).toEqual(parsed.global)
   })
 })
 
