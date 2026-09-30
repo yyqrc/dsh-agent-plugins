@@ -3,10 +3,14 @@
  *
  * This package reads the file surface an agent-plugins.org plugin directory
  * exposes: plugin.json, mcp.json, one SKILL.md per skills subdirectory, and
- * one markdown file per command. Every value here crosses a durable-file
- * boundary, so each parser validates its input and returns a typed record or
- * a rejection reason; the loader decides whether a rejection skips one file
- * or one plugin.
+ * one markdown file per command. Plugins that ship the Codex or Claude Code
+ * deployment manifests instead are read through the same parser: the standard
+ * plugin.json always outranks `.codex-plugin/plugin.json`, which outranks
+ * `.claude-plugin/plugin.json`, and each contribution (identity, skills root,
+ * MCP declaration) comes from the highest-ranking manifest that supplies it.
+ * Every value here crosses a durable-file boundary, so each parser validates
+ * its input and returns a typed record or a rejection reason; the loader
+ * decides whether a rejection skips one file or one plugin.
  *
  * @module @deepseek-ai/dsh-agent-plugins/manifest
  */
@@ -23,6 +27,19 @@ export const SKILLS_DIR = 'skills'
 export const COMMANDS_DIR = 'commands'
 export const MANIFEST_FILE = 'plugin.json'
 export const MCP_FILE = 'mcp.json'
+
+/** Codex dialect manifest directory, consulted when the standard manifest lacks a value. */
+export const CODEX_DIR = '.codex-plugin'
+/** Claude Code dialect manifest directory, consulted after {@link CODEX_DIR}. */
+export const CLAUDE_DIR = '.claude-plugin'
+/** Claude Code's plugin-root variable, expanded alongside `${PLUGIN_ROOT}`. */
+export const CLAUDE_PLUGIN_ROOT_VAR = '${CLAUDE_PLUGIN_ROOT}'
+/**
+ * Dialect manifest directories in precedence order. The standard `plugin.json`
+ * always outranks them: a dialect only supplies the name, skills root, or MCP
+ * declaration the standard manifest does not provide.
+ */
+const DIALECT_DIRS = [CODEX_DIR, CLAUDE_DIR] as const
 
 /** The one manifest field the loader must keep to identify a plugin. */
 export interface PluginManifest {
@@ -108,7 +125,12 @@ interface CommandFrontmatter {
   readonly 'argument-hint'?: string
 }
 
-/** Entry points a mcp.json server may declare under this adapter's scope. */
+/**
+ * Entry points a server declaration may carry under this adapter's scope.
+ * `type` is optional because the Codex dialect infers it from the fields; the
+ * `streamable-http` spelling used by plugin-authored `mcp.json` files is
+ * normalized to `http` on read.
+ */
 type McpServerEntry =
   | { readonly type: 'stdio'; readonly command: string; readonly args?: readonly string[]; readonly env?: Readonly<Record<string, string>> }
   | { readonly type: 'http'; readonly url: string; readonly headers?: Readonly<Record<string, string>> }
@@ -117,36 +139,100 @@ interface McpManifestFile {
   readonly mcpServers?: Readonly<Record<string, unknown>>
 }
 
+/** One manifest file's contribution, kept separate so dialects never merge. */
+interface ManifestFace {
+  /** Absolute manifest path, used in diagnostics. */
+  readonly path: string
+  /** Validated identity contributed by this manifest. */
+  readonly manifest: PluginManifest
+  /** Declared skills roots, plugin-relative; empty when the manifest declares none. */
+  readonly skills: readonly string[]
+  /** Raw `mcpServers` value: an inline server map or a plugin-relative JSON path. */
+  readonly mcp: unknown
+}
+
+/** Outcome of reading one manifest file. */
+type ManifestFaceResult =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'invalid'; readonly problem: ManifestProblem }
+  | { readonly kind: 'face'; readonly face: ManifestFace }
+
 /**
  * Load one plugin directory: manifest first, then skills, commands, and MCP
- * servers. A missing or invalid `plugin.json` rejects the whole directory;
- * problems inside the other files degrade to per-file problems so one broken
- * skill does not hide the rest of the plugin.
+ * servers. The standard `plugin.json` outranks the dialect manifests
+ * (`.codex-plugin`, then `.claude-plugin`): each contribution — identity,
+ * skills root, MCP declaration — comes from the highest-ranking manifest that
+ * supplies it, and a dialect is consulted only where the standard face is
+ * silent. A directory carrying no manifest at all is rejected; problems inside
+ * the other files degrade to per-file problems so one broken skill does not
+ * hide the rest of the plugin.
  * @param root - absolute plugin directory.
  * @returns the loaded plugin or the rejection with its accumulated problems.
  */
 export async function loadPlugin(root: string): Promise<LoadPluginResult> {
   const problems: ManifestProblem[] = []
-  const manifestFile = join(root, MANIFEST_FILE)
-  const manifest = await readJson(manifestFile)
-  if (!manifest.ok) {
-    return { ok: false, problems: [{ path: manifest.path, reason: manifest.reason }] }
+  const standard = await readManifestFace(join(root, MANIFEST_FILE))
+  if (standard.kind === 'invalid') problems.push(standard.problem)
+  const dialects: ManifestFace[] = []
+  for (const dir of DIALECT_DIRS) {
+    const dialect = await readManifestFace(join(root, dir, MANIFEST_FILE))
+    if (dialect.kind === 'invalid') problems.push(dialect.problem)
+    if (dialect.kind === 'face') dialects.push(dialect.face)
   }
-  const parsed = parsePluginManifest(manifest.value)
-  if (!parsed.ok) {
-    return { ok: false, problems: [{ path: manifestFile, reason: parsed.reason }] }
+  const standardFace = standard.kind === 'face' ? standard.face : undefined
+  const faces = standardFace === undefined ? dialects : [standardFace, ...dialects]
+  const primary = standardFace ?? dialects[0]
+  if (primary === undefined) {
+    return {
+      ok: false,
+      problems: problems.length > 0 ? problems : [{
+        path: join(root, MANIFEST_FILE),
+        reason: `missing file: no ${MANIFEST_FILE}, ${DIALECT_DIRS.map(dir => `${dir}/${MANIFEST_FILE}`).join(', or ')}`,
+      }],
+    }
   }
-  const skills = await loadSkills(join(root, SKILLS_DIR), problems)
+  const skillsRoots = faces.find(face => face.skills.length > 0)?.skills ?? [SKILLS_DIR]
+  const skills = await loadSkills(skillsRoots, root, problems)
   const commands = await loadCommands(join(root, COMMANDS_DIR), problems)
-  const mcpServers = await loadMcpServers(join(root, MCP_FILE), root, parsed.value.name, problems)
-  return { ok: true, plugin: { root, manifest: parsed.value, skills, commands, mcpServers }, problems }
+  const mcpServers = await loadMcpServers(root, primary.manifest.name, dialects, problems)
+  return { ok: true, plugin: { root, manifest: primary.manifest, skills, commands, mcpServers }, problems }
+}
+
+/** Read and validate one manifest file, distinguishing absence from rejection. */
+async function readManifestFace(file: string): Promise<ManifestFaceResult> {
+  const raw = await readJson(file)
+  if (!raw.ok) return raw.absent ? { kind: 'absent' } : { kind: 'invalid', problem: { path: file, reason: raw.reason } }
+  const parsed = parsePluginManifest(raw.value)
+  if (!parsed.ok) return { kind: 'invalid', problem: { path: file, reason: parsed.reason } }
+  const record = raw.value as Record<string, unknown>
+  return {
+    kind: 'face',
+    face: {
+      path: file,
+      manifest: parsed.value,
+      skills: parseSkillsRoots(record.skills),
+      mcp: record.mcpServers,
+    },
+  }
+}
+
+/**
+ * Normalize a manifest `skills` declaration into plugin-relative roots. The
+ * dialects spell this as one path (`"./skills/"`) or a list of paths; any other
+ * shape contributes nothing so the caller falls back to the standard layout.
+ */
+function parseSkillsRoots(value: unknown): readonly string[] {
+  const roots = typeof value === 'string' ? [value] : Array.isArray(value) ? value : []
+  return roots
+    .filter((root): root is string => typeof root === 'string' && root.trim().length > 0)
+    .map(root => root.trim())
 }
 
 /**
  * Discover plugin directories one level under each configured root, in root
- * order. A directory without a `plugin.json` is skipped with a problem; a
- * plugin name already seen from an earlier root is skipped with a problem so
- * earlier roots win deterministically.
+ * order. A directory carrying no manifest — standard or dialect — is skipped
+ * with a problem; a plugin name already seen from an earlier root is skipped
+ * with a problem so earlier roots win deterministically.
  * @param roots - absolute scan roots.
  * @returns loaded plugins plus every problem, both orders preserved.
  */
@@ -177,51 +263,72 @@ export async function discoverPlugins(roots: readonly string[]): Promise<{
 }
 
 /**
- * Expand the Agent Plugins `${PLUGIN_ROOT}` variable in one manifest string.
+ * Expand the plugin-root variables a manifest string may carry: the Agent
+ * Plugins `${PLUGIN_ROOT}` and the Claude Code `${CLAUDE_PLUGIN_ROOT}`.
  * @param value - raw manifest string.
  * @param root - absolute plugin root directory.
  * @returns the expanded string.
  */
 export function expandPluginRoot(value: string, root: string): string {
-  return value.replaceAll('${PLUGIN_ROOT}', root)
+  return value.replaceAll('${PLUGIN_ROOT}', root).replaceAll(CLAUDE_PLUGIN_ROOT_VAR, root)
 }
 
-/** Read one plugin's skills directory into validated skill registrations. */
-async function loadSkills(dir: string, problems: ManifestProblem[]): Promise<readonly SkillRegistration[]> {
+/**
+ * Read the declared skills roots into validated skill registrations. Roots are
+ * plugin-relative and resolved against the plugin root; a duplicate skill name
+ * across roots resolves first-wins so the precedence order stays deterministic.
+ * @param roots - declared plugin-relative skills roots, in precedence order.
+ * @param pluginRoot - absolute plugin root the roots resolve against.
+ * @param problems - accumulator for per-file rejections.
+ * @returns validated skill registrations.
+ */
+async function loadSkills(
+  roots: readonly string[],
+  pluginRoot: string,
+  problems: ManifestProblem[],
+): Promise<readonly SkillRegistration[]> {
   const skills: SkillRegistration[] = []
-  for (const entry of await listDirectories(dir, problems)) {
-    const file = join(entry, 'SKILL.md')
-    const raw = await readText(file)
-    if (!raw.ok) {
-      problems.push({ path: file, reason: raw.reason })
-      continue
+  const seen = new Set<string>()
+  for (const root of roots) {
+    for (const entry of await listDirectories(resolve(pluginRoot, root), problems)) {
+      const file = join(entry, 'SKILL.md')
+      const raw = await readText(file)
+      if (!raw.ok) {
+        problems.push({ path: file, reason: raw.reason })
+        continue
+      }
+      const parsed = parseFrontmatter(raw.value)
+      if (!parsed.ok) {
+        problems.push({ path: file, reason: parsed.reason })
+        continue
+      }
+      const front = parsed.value as Partial<SkillFrontmatter>
+      const name = front.name
+      const description = front.description
+      if (typeof name !== 'string' || !isSkillName(name)) {
+        problems.push({ path: file, reason: `invalid skill name "${String(name)}" (kebab-case required)` })
+        continue
+      }
+      if (typeof description !== 'string' || description.trim().length === 0) {
+        problems.push({ path: file, reason: 'skill description must not be empty' })
+        continue
+      }
+      if (seen.has(name)) {
+        problems.push({ path: file, reason: `skill "${name}" is already loaded from an earlier skills root` })
+        continue
+      }
+      seen.add(name)
+      skills.push({
+        name,
+        description,
+        ...typeof front.whenToUse === 'string' ? { whenToUse: front.whenToUse } : {},
+        ...isObject(front.metadata) ? { metadata: front.metadata } : {},
+        content: parsed.body,
+        source: 'agent-plugin',
+        resourceBase: { kind: 'directory', path: entry },
+        path: file,
+      })
     }
-    const parsed = parseFrontmatter(raw.value)
-    if (!parsed.ok) {
-      problems.push({ path: file, reason: parsed.reason })
-      continue
-    }
-    const front = parsed.value as Partial<SkillFrontmatter>
-    const name = front.name
-    const description = front.description
-    if (typeof name !== 'string' || !isSkillName(name)) {
-      problems.push({ path: file, reason: `invalid skill name "${String(name)}" (kebab-case required)` })
-      continue
-    }
-    if (typeof description !== 'string' || description.trim().length === 0) {
-      problems.push({ path: file, reason: 'skill description must not be empty' })
-      continue
-    }
-    skills.push({
-      name,
-      description,
-      ...typeof front.whenToUse === 'string' ? { whenToUse: front.whenToUse } : {},
-      ...isObject(front.metadata) ? { metadata: front.metadata } : {},
-      content: parsed.body,
-      source: 'agent-plugin',
-      resourceBase: { kind: 'directory', path: entry },
-      path: file,
-    })
   }
   return skills
 }
@@ -264,55 +371,77 @@ async function loadCommands(dir: string, problems: ManifestProblem[]): Promise<r
   return commands
 }
 
-/** Read one plugin's mcp.json into bridge-ready server declarations. */
+/**
+ * Read one plugin's MCP declarations into bridge-ready server entries.
+ *
+ * Sources are consulted in precedence order: the standard `mcp.json` first,
+ * then each dialect manifest's `mcpServers`. A dialect may inline the server
+ * map or point at a plugin-relative JSON file (the Claude Code spelling), and
+ * the first source that yields servers wins, so a plugin never gets the same
+ * server mounted twice from two dialects.
+ * @param root - absolute plugin root directory.
+ * @param pluginName - canonical plugin name for server namespacing.
+ * @param dialects - dialect faces in precedence order, already read.
+ * @param problems - accumulator for per-file rejections.
+ * @returns declared MCP servers, or an empty list when none is declared.
+ */
 async function loadMcpServers(
-  file: string,
   root: string,
   pluginName: string,
+  dialects: readonly ManifestFace[],
   problems: ManifestProblem[],
 ): Promise<readonly McpServerManifest[]> {
-  const raw = await readJson(file)
-  if (!raw.ok) {
-    if (raw.absent) return []
-    problems.push({ path: file, reason: raw.reason })
-    return []
-  }
-  const parsed = parseMcpManifest(raw.value)
-  if (!parsed.ok) {
-    problems.push({ path: file, reason: parsed.reason })
-    return []
-  }
-  const servers: McpServerManifest[] = []
-  for (const [key, entry] of Object.entries(parsed.value)) {
-    const value = entry
-    const serverName = mcpServerName(pluginName, key)
-    if (value.type === 'stdio') {
-      servers.push({
-        serverName,
-        config: {
-          transport: 'stdio',
-          serverName,
-          command: expandPluginRoot(value.command, root),
-          args: (value.args ?? []).map(argument => expandPluginRoot(argument, root)),
-          env: value.env === undefined
-            ? {}
-            : Object.fromEntries(Object.entries(value.env).map(([name, envValue]) => [name, expandPluginRoot(envValue, root)])),
-          cwd: root,
-        },
-      })
-    } else {
-      servers.push({
-        serverName,
-        config: {
-          transport: 'streamable-http',
-          serverName,
-          url: expandPluginRoot(value.url, root),
-          headers: value.headers === undefined ? {} : { ...value.headers },
-        },
-      })
+  const sources: { readonly path: string; readonly value: unknown }[] = []
+  const standard = await readJson(join(root, MCP_FILE))
+  if (standard.ok) sources.push({ path: join(root, MCP_FILE), value: standard.value })
+  else if (!standard.absent) problems.push({ path: standard.path, reason: standard.reason })
+  for (const dialect of dialects) {
+    if (dialect.mcp === undefined) continue
+    if (typeof dialect.mcp === 'string' && dialect.mcp.trim().length > 0) {
+      const path = resolve(root, expandPluginRoot(dialect.mcp.trim(), root))
+      const referenced = await readJson(path)
+      if (referenced.ok) sources.push({ path, value: referenced.value })
+      else if (!referenced.absent) problems.push({ path, reason: referenced.reason })
+      continue
     }
+    sources.push({ path: dialect.path, value: { mcpServers: dialect.mcp } })
   }
-  return servers
+  for (const source of sources) {
+    const parsed = parseMcpManifest(source.value)
+    if (!parsed.ok) {
+      problems.push({ path: source.path, reason: parsed.reason })
+      continue
+    }
+    const entries = Object.entries(parsed.value)
+    if (entries.length === 0) continue
+    return entries.map(([key, value]): McpServerManifest => {
+      const serverName = mcpServerName(pluginName, key)
+      return value.type === 'stdio'
+        ? {
+          serverName,
+          config: {
+            transport: 'stdio',
+            serverName,
+            command: expandPluginRoot(value.command, root),
+            args: (value.args ?? []).map(argument => expandPluginRoot(argument, root)),
+            env: value.env === undefined
+              ? {}
+              : Object.fromEntries(Object.entries(value.env).map(([name, envValue]) => [name, expandPluginRoot(envValue, root)])),
+            cwd: root,
+          },
+        }
+        : {
+          serverName,
+          config: {
+            transport: 'streamable-http',
+            serverName,
+            url: expandPluginRoot(value.url, root),
+            headers: value.headers === undefined ? {} : { ...value.headers },
+          },
+        }
+    })
+  }
+  return []
 }
 
 /** Validate the plugin.json envelope; only the name is load-bearing. */
@@ -347,10 +476,21 @@ function parseMcpManifest(value: unknown): { ok: true; value: Readonly<Record<st
   return { ok: true, value: entries }
 }
 
-/** Validate one mcp.json server entry. */
+/**
+ * Validate one MCP server entry.
+ *
+ * `type` is optional: the Codex dialect omits it for HTTP servers, so the
+ * transport is inferred from the fields actually present — `command` means
+ * stdio, `url` means http. A present-but-not-string `type` is rejected instead
+ * of being inferred, so a typo never silently mounts the wrong transport.
+ */
 function parseMcpServerEntry(key: string, value: unknown): { ok: true; value: McpServerEntry } | { ok: false; reason: string } {
   if (!isObject(value)) return { ok: false, reason: `mcp server "${key}" must be an object` }
-  const type = value.type
+  const declared = value.type
+  if (declared !== undefined && typeof declared !== 'string') {
+    return { ok: false, reason: `mcp server "${key}" type must be a string` }
+  }
+  const type = declared ?? (typeof value.command === 'string' ? 'stdio' : typeof value.url === 'string' ? 'http' : undefined)
   if (type === 'stdio') {
     const command = value.command
     if (typeof command !== 'string' || command.trim().length === 0) {
@@ -374,7 +514,7 @@ function parseMcpServerEntry(key: string, value: unknown): { ok: true; value: Mc
       },
     }
   }
-  if (type === 'http') {
+  if (type === 'http' || type === 'streamable-http') {
     const url = value.url
     if (typeof url !== 'string' || url.trim().length === 0) {
       return { ok: false, reason: `http server "${key}" requires a non-empty url` }
@@ -392,7 +532,7 @@ function parseMcpServerEntry(key: string, value: unknown): { ok: true; value: Mc
       },
     }
   }
-  return { ok: false, reason: `mcp server "${key}" has unsupported type "${String(type)}" (expected stdio or http)` }
+  return { ok: false, reason: `mcp server "${key}" has unsupported type "${String(type)}" (expected stdio, http, or streamable-http)` }
 }
 
 /**

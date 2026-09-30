@@ -60,7 +60,7 @@ pnpm exec tsx scripts/verify-agent-note-format.ts
 ## 这个插件不是什么（禁止改偏的边界）
 
 - 不是插件市场、不是远程安装器：默认只扫描本地目录（`Config.pluginDirs`，默认 `<dsh home>/agent-plugins`），不读任何市场清单，不做远程安装与版本管理。唯一例外：`sourcesFile`（默认 `<dsh home>/agent-plugins/sources.yml`，`false` 禁用）存在时，激活前按该 DSH 侧声明文件的 `plugins` map（name → source：本地绝对路径/相对声明文件的路径/git URL，`git+<url>#<子路径>` 选择仓库内子目录作插件根）把插件同步进安装根（git 源 fetch 到远端默认分支最新，无版本 pin）；同步先于扫描加载，加载阶段仍只读。
-- 不是 Claude Code / Codex 插件系统兼容层：**不读** `.claude-plugin/`、`.codex-plugin/`、`.codebuddy-plugin/`、`hooks.json`、`AGENTS.md` 代理文件。这些属于其他包（如 `hooks-claude-code`）的职责，不要合并进来。
+- 不是 Claude Code / Codex / CodeBuddy 插件系统的运行时兼容层：只读它们的**部署清单**来取名称、skills 根与 MCP 声明（见「核心设计决策 9」），**不读** `hooks.json`、`AGENTS.md` 代理文件，也不实现它们的 hook、agent、命令方言。`.codebuddy-plugin/` 不读。hook 与代理文件属于其他包（如 `hooks-claude-code`）的职责，不要合并进来。
 - 不实现 Agent Plugins 1.0 的 `agents/`、`hooks/` 目录面——只消费 skills、commands、MCP 三样。
 - 不写插件目录本身：loader 只读插件文件，**绝不修改已加载的插件**。唯一例外：`autoUpdate` 显式开启（默认关）时，激活前按各根目录 `installed.json` 记录刷新插件目录（版本字符串不等即整目录重拷 + 回写记录）；刷新先于扫描加载，加载阶段仍只读。
 
@@ -69,17 +69,19 @@ pnpm exec tsx scripts/verify-agent-note-format.ts
 1. **命名空间默认开**：`namespaceSkills` / `namespaceCommands` 默认 `true`，技能/命令名变成 `<plugin>-<skill>`（如 `demo-toolkit-apply-hotfix`）。目的是让两个插件的同名技能都能被寻址。关掉会回归 first-wins 遮蔽——除非有明确需求，不要改默认值。
 2. **过滤语义**：全局文件 `<dsh home>/agent-plugins.yml`。`enable` 是非空白名单；`disable` **恒胜**于 enable；`workspaces` 按 cwd 路径前缀（边界安全匹配）把该条目的 enable/disable **合并**到全局。`filterForWorkspace()` 是唯一合并点，改过滤必须同步改它和 `isPluginEnabled()`。
 3. **MCP 不参与过滤**：MCP tools 挂在进程级 `ctx.tools`，按 workspace 过滤会破坏共享注册表。这是刻意设计，README 的 Limitations 里也写了；不要"顺手"把 MCP 塞进过滤。
-4. **`${PLUGIN_ROOT}` 展开**：mcp.json 里的变量展开为插件根目录绝对路径，`cwd` 强制为插件根目录。这是 Agent Plugins 标准语义。
+4. **插件根变量展开**：`${PLUGIN_ROOT}`（标准）和 `${CLAUDE_PLUGIN_ROOT}`（Claude Code 方言）都展开为插件根目录绝对路径，`cwd` 强制为插件根目录。后者的插件相对 `cwd`（如 `"."`）也解析为插件根。
 5. **serverName 规范化**：`ap_<plugin>_<serverKey>`，非法字符替换为 `_`，截断 32 字符；重名时后者跳过并警告（不自动改名）。
-6. **fail-soft 边界**：单个 skill/command/mcp 条目坏 → 跳过该条目 + 日志警告；`plugin.json` 坏或缺失 → 拒绝整个插件；跨根同名插件 → 先者赢。不要改成"一个坏条目拖垮整个插件"。
+6. **fail-soft 边界**：单个 skill/command/mcp 条目坏 → 跳过该条目 + 日志警告；**所有**清单都坏或都不存在 → 拒绝整个插件（只有一个坏方言清单、标准清单完好时，只记 problem 并继续用标准清单）；跨根同名插件 → 先者赢。不要改成"一个坏条目拖垮整个插件"。
 7. **技能注册走 cwd 敏感 provider**（`PluginSkillProvider`）：因为要按会话 workspace 过滤，不能用一次性 `ctx.skills.register()`。provider 的 `list()` 每次读全局过滤文件并按 `options.cwd` 合并。
 8. **内置刷新先于加载**（`autoUpdate`，默认关）：`apply()` 在 `discoverPlugins()` 之前对每个 `pluginDirs` 根读 `installed.json`（`source`/`version`），source 的 `plugin.json` 版本与记录**字符串不等**即刷新——staging 目录整树复制（排除 `.git`/`.temp`/`__pycache__`/`node_modules`/`installed.json`/`*.pyc`，深度上限 64 防符号环）→ 删旧目录 → rename 落位；成功才回写记录（保留未知字段，只改 `version`/`installedAt`）。任何失败 fail-soft 跳过该插件并 warn，绝不破坏旧安装、不阻断启动。刷新先于扫描，因此本次激活直接用新文件；刷新只在激活时跑一次，不做进程间锁（并发启动最后写者赢，均为完整快照）。改刷新语义必须同步改 `refreshInstalledPlugins()` 和 `auto-update.spec.ts`。
+9. **方言清单回退（`.codex-plugin` → `.claude-plugin`）**：一个插件目录可由标准 `plugin.json` 或任一方言清单提供身份与配置。排名是 `plugin.json` > `.codex-plugin/plugin.json` > `.claude-plugin/plugin.json`；**每项贡献（名称、skills 根、MCP 声明）各自取排名最高且提供了该项的清单**，方言只补标准没给的那一项，不做字段级深合并、不整体接管。发现阶段任一清单存在即可加载（因此只带方言的插件不会被跳过）。方言 `skills` 支持字符串或数组（插件相对路径，缺省回退 `skills/`）；方言 `mcpServers` 支持内联 map 或**插件相对 JSON 路径**（Claude Code 写法）。`${CLAUDE_PLUGIN_ROOT}` 与 `${PLUGIN_ROOT}` 都展开为插件根。`.codebuddy-plugin/` 不读。改方言语义必须同步改 `readManifestFace()`、`loadMcpServers()` 与 `manifest.spec.ts` 的 dialect 用例。
+10. **MCP 传输类型归一**：`stdio` / `http` / `streamable-http` 三种拼写都接受（插件自带的 `mcp.json` 用 `streamable-http`；Claude Code 用 `http`），统一归一到 `streamable-http` 传输；`type` 可省略，按 `command`（stdio）或 `url`（http）推断——Codex 方言对内联 HTTP 服务器不写 `type`。两者都缺才拒绝。
 
 编译报错速查见 `INSTALL.md` 的「编译报错速查表」。
 
 ## 测试必须覆盖的行为面
 
-- `manifest.spec.ts`：plugin.json 校验、skill/command frontmatter 解析、`${PLUGIN_ROOT}` 展开、stdio/http 两种 MCP、junction 目录发现、坏条目 fail-soft。
+- `manifest.spec.ts`：plugin.json 校验、skill/command frontmatter 解析、`${PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_ROOT}` 展开、stdio/http/streamable-http 三种 MCP 归一、省略 `type` 的传输推断、junction 目录发现、坏条目 fail-soft；方言面必须覆盖：只带 Codex 清单可加载、只带 Claude 清单可加载（含 `mcpServers` 指向外部 JSON）、标准清单压过方言、Codex 压过 Claude、方言 `skills` 声明决定 skills 根、方言指向的 MCP 文件缺失时 fail-soft、只有坏方言清单时仍拒绝整个插件。
 - `agent-plugins.spec.ts`：命名空间（开/关）、`isPluginEnabled` 语义、全局过滤文件解析、`filterForWorkspace` 前缀合并、命令注入、被禁用插件的技能隐藏与命令报错。
 - `mcp-mount.spec.ts`：MCP 子插件挂载、config 传递、重名跳过。
 - `auto-update.spec.ts`：installed.json 缺失/坏 JSON/非对象跳过、记录 key 与 source 校验（相对路径、缺 plugin.json、无版本）、版本相同不动文件、版本不同重拷+回写（未知字段保留）、排除名单剥离、拷贝失败旧安装完好且无 staging 残留、`autoUpdate` 默认关零写入、开启后本次激活即加载新版本（集成在 agent-plugins.spec.ts）。

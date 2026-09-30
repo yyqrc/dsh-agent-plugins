@@ -57,6 +57,28 @@ powershell -File <本仓库路径>\sync-to-dsh.ps1
 
 重启后新开/恢复会话，检查技能目录里出现 `<plugin>-<skill>` 命名的条目（例如 `demo-toolkit-apply-hotfix`、`sample-engine-native-debug`）。看不到就先按下面「故障排查」。
 
+## 插件目录要满足什么（发现与清单）
+
+每个扫描根下一层的目录，只要带下面**任一**清单就会被加载：
+
+- 标准 `plugin.json`（Agent Plugins 1.0）
+- `.codex-plugin/plugin.json`（Codex 部署清单）
+- `.claude-plugin/plugin.json`（Claude Code 部署清单）
+
+三者排名 `plugin.json` > `.codex-plugin` > `.claude-plugin`，且**每项配置各自取排名最高且提供了该项的清单**：名称、skills 根、MCP 声明互不牵连，方言只补标准没给的那一项（不做字段级合并，也不整体接管）。所以"标准 `plugin.json` 只写 name、skills 和 MCP 都写在 `.codex-plugin` 里"是受支持的常见形态。
+
+- skills 根缺省是 `skills/`；方言声明了 `skills`（字符串或数组，插件相对路径）时以它为准。
+- MCP 取**第一个有内容的来源**：标准 `mcp.json`，或方言的 `mcpServers`（内联 map，或插件相对 JSON 路径，如 `"./.claude-mcp.json"`）。
+- `type` 可省略（按 `command`/`url` 推断）；`stdio`、`http`、`streamable-http` 三种拼写都接受，后两者都归一到 `streamable-http`。
+- `${PLUGIN_ROOT}` 与 `${CLAUDE_PLUGIN_ROOT}` 都展开为插件根目录，`cwd` 强制为插件根。
+- 只读**部署清单**：方言的 hook、agent、command、市场元数据都不实现，`.codebuddy-plugin/` 不读。
+
+### 过滤名单按清单 `name` 匹配，不是目录名
+
+`~/.dsh/agent-plugins.yml` 的 `enable`/`disable` 匹配的是 `plugin.json` 的 `name` 字段。**目录名与 `name` 不一致时，必须写 `name`**，否则插件虽已加载却会在技能目录里消失。已踩过的坑：目录 `cptools_mcp` 的清单 `name` 是 `cptools-mcp`，名单里写 `cptools_mcp` 会静默隐藏该插件。
+
+排查手法：打印每个已装插件的清单名，与 `agent-plugins.yml` 的名单逐条比对。
+
 ## 编译报错速查表
 
 | 报错 | 原因 | 处理 |
@@ -72,7 +94,20 @@ powershell -File <本仓库路径>\sync-to-dsh.ps1
 | `expected a package here (no package.json found)`（constraints gate） | DSH 仓库里存在没有 package.json 的残留目录（如被合并掉的 `client/web-react`） | 删除该残留目录（这不是插件的问题） |
 | `session header cwd must be an absolute path`（测试失败） | 测试里 fake session 的 cwd 给了空串 | 用 `process.cwd()` 或绝对路径 |
 | 测试全绿但运行中 DSH 看不到插件技能 | `lib/` 是旧的（改 src 后没跑 tsdown） | 重新跑「步骤 C」的 tsdown，然后重启 DSH |
+| 技能目录里有插件技能，但模型工具表里看不到该插件的 MCP 工具 | 宿主工具面被收口（本机 Sacha 部署由 `sacha_tools` 控制可见性），MCP 工具已注册但默认 `hidden` | 见下方「MCP 工具默认不进模型工具表」——这是该部署的策略，不是挂载失败 |
 | `ERR_MODULE_NOT_FOUND` 从独立插件仓的 `lib/` 报缺少 workspace 包 | 独立仓 `node_modules` 未 junction 到 DSH 编译锚点 | 先在 DSH 根运行 `pnpm install`，再运行 `install.ps1` 创建依赖 junction |
+
+## MCP 工具默认不进模型工具表（不是故障）
+
+改完 loader 重启后，常见误判是「技能出现了、但 MCP 工具没出现 = 挂载失败」。实际上**挂载、注册、进工具表是三件事**：
+
+1. **挂载**：loader 把 `mcp.json` / 方言 `mcpServers` 的每个 server 作为 `dsh-mcp-client` 子插件拉起 → 看子进程是否存在（如 `python.exe .../native_debug_mcp.py`）、http 型看端口是否从仅 Listen 变为 Established。
+2. **注册**：工具以 `mcp__ap_<plugin>_<server>__<tool>` 进 `ctx.tools` 注册表 → 用工具目录接口（本机是 `sacha_tools` 的 `catalog`）按关键字查得到即已注册。
+3. **进工具表**：`request/header` 里模型实际看到的列表。**本机 Sacha 部署默认把 MCP 工具收口为 `hidden`**，只暴露 16 个常驻工具，所以注册表里有、工具表里没有是正常的策略结果。
+
+判定方法：先按顺序确认 1、2 成立；要确认 3 的链路也通，把目标工具显式解锁（`sacha_tools` 的 `unlock`）后，**下一个** `request/header` 就会带上它（解锁当次不生效，提示原文是 "Unlocked tools become callable only after a later request header advertises them"）。实测：解锁 2 个 MCP 工具后工具表从 16 → 18。
+
+> 该可见性策略属于宿主部署（`sacha_tools`），不归本 loader 管；loader 的职责只到第 2 步「注册进 `ctx.tools`」。如果第 1 或第 2 步就不成立，才回来查本插件（方言清单是否被读到、`serverName` 是否规范化、类型是否可识别）。
 
 ## 验证清单（装完 / 改完都要过）
 

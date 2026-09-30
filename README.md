@@ -2,9 +2,9 @@
 
 Agent Plugins 1.0 compatibility layer.
 
-Discovers agent-plugins.org plugin directories under the configured roots and mounts each plugin's contributions on the harness registries: skills from the plugin's `skills` directory register on `ctx.skills`, slash commands from the plugin's `commands` directory register on `ctx.commands`, and MCP servers from `mcp.json` mount as `dsh-mcp-client` instances whose tools surface under the `mcp__<serverName>__<tool>` namespace.
+Discovers agent-plugins.org plugin directories under the configured roots and mounts each plugin's contributions on the harness registries: skills from the plugin's `skills` directory register on `ctx.skills`, slash commands from the plugin's `commands` directory register on `ctx.commands`, and MCP servers from `mcp.json` mount as `dsh-mcp-client` instances whose tools surface under the `mcp__<serverName>__<tool>` namespace. Plugins shipping the Codex (`.codex-plugin/`) or Claude Code (`.claude-plugin/`) deployment manifests are read through the same path, so a plugin that declares its skills and MCP servers only in a dialect manifest still loads.
 
-This package is a compatibility bridge for directory-form plugins. It does not implement the Claude Code / Codex hook surfaces, and its source declaration support is opt-in directory sync (see Source declarations) rather than a remote installer with version pinning.
+This package is a compatibility bridge for directory-form plugins. It does not implement the Claude Code / Codex hook, agent, or command surfaces, and its source declaration support is opt-in directory sync (see Source declarations) rather than a remote installer with version pinning.
 
 ## Plugin
 
@@ -110,14 +110,19 @@ Set `sourcesFile: false` to disable declaration sync entirely — then the loade
 
 ## Discovery
 
-Each configured root is scanned one level deep for directories containing a `plugin.json`. Within one plugin directory:
+Each configured root is scanned one level deep for directories containing a plugin manifest. A directory is loadable when it carries the standard `plugin.json`, the Codex dialect `.codex-plugin/plugin.json`, or the Claude Code dialect `.claude-plugin/plugin.json`; a directory carrying none of them is rejected.
 
-- `plugin.json` must be a JSON object with a non-empty string `name`; a missing or invalid manifest rejects the whole directory.
-- `skills/<name>/SKILL.md` files parse YAML frontmatter with `name` (kebab-case), `description`, optional `whenToUse`, and optional `metadata`; the body becomes the skill content and the skill directory is its resource base. Registered skill names carry the plugin prefix by default (`<plugin>-<name>`).
+Manifests rank `plugin.json` > `.codex-plugin/plugin.json` > `.claude-plugin/plugin.json`, and each contribution is resolved independently: the identity, the skills root, and the MCP declaration each come from the highest-ranking manifest that supplies it. A dialect therefore only fills in what the standard manifest leaves out — it never merges field-by-field and never takes over wholesale. The standard `plugin.json` must be a JSON object with a non-empty string `name`; a missing or invalid standard manifest is reported as a problem but does not reject the plugin while a valid dialect manifest exists.
+
+Within one plugin directory:
+
+- `skills/<name>/SKILL.md` files parse YAML frontmatter with `name` (kebab-case), `description`, optional `whenToUse`, and optional `metadata`; the body becomes the skill content and the skill directory is its resource base. The scanned root defaults to `skills/` and follows a dialect `skills` declaration (a single path or a list of plugin-relative paths) when one is present. Registered skill names carry the plugin prefix by default (`<plugin>-<name>`).
 - `commands/<name>.md` files parse frontmatter `description` and optional `argument-hint`; the body is a prompt template where `$ARGUMENTS` is replaced with the invocation input. The rendered template is injected into the receiving agent as `instructions`-form plugin context. Registered command names carry the plugin prefix by default.
-- `mcp.json` (a JSON object with an optional `mcpServers` map) declares `stdio` servers (`command`, `args`, `env`, all with `${PLUGIN_ROOT}` expanded against the plugin root, `cwd` set to the plugin root) and `http` servers (mapped to the bridge's `streamable-http` transport). Each server mounts as a child `dsh-mcp-client` instance whose `serverName` is `ap_<plugin>_<serverKey>` normalized to the bridge namespace grammar and truncated to 32 characters.
+- MCP servers come from the first source that declares any: the standard `mcp.json` (`{ "mcpServers": { ... } }`), or a dialect manifest's `mcpServers` — either inline (`{ "mcpServers": { ... } }`) or a plugin-relative path to a JSON file (the Claude Code spelling, e.g. `"./.claude-mcp.json"`). Servers declare `stdio` (`command`, `args`, `env`, all with `${PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_ROOT}` expanded against the plugin root, `cwd` forced to the plugin root) or HTTP (`http` or `streamable-http`, both mapped to the bridge's `streamable-http` transport); `type` may be omitted and is then inferred from `command` vs `url`. Each server mounts as a child `dsh-mcp-client` instance whose `serverName` is `ap_<plugin>_<serverKey>` normalized to the bridge namespace grammar and truncated to 32 characters.
 
-Per-file problems (malformed frontmatter, invalid names, unsupported transport types) are logged and skip only that file; a plugin that fails its `plugin.json` is skipped whole. Duplicate plugin names resolve to the earliest root; duplicate normalized MCP server names skip later servers with a warning.
+The Codex and Claude Code **hook, agent, and command dialects are not implemented**, and `.codebuddy-plugin/` is not read; only the deployment manifests participate, for identity, skills roots, and MCP declarations.
+
+Per-file problems (malformed frontmatter, invalid names, unsupported transport types) are logged and skip only that file; a plugin whose every manifest is invalid or absent is skipped whole. Duplicate plugin names resolve to the earliest root; duplicate normalized MCP server names skip later servers with a warning.
 
 MCP child instances are awaited during this plugin's activation, so the loader reports a failed initial connection as a warning and leaves the rest of the plugin mounted.
 
@@ -160,6 +165,7 @@ Append-only: each invocation appends one instruction message to the request hist
 - **Source declaration sync is opt-in, unclocked, and without version pinning** — it reads only the DSH-side `sourcesFile` (default `<dsh home>/agent-plugins/sources.yml`; disable with `false`), fetches git sources to the remote's default branch tip with no tag/commit pinning, runs once per activation with no cross-process lock, and skips a failing plugin instead of blocking startup. Enable/disable per plugin remains the job of the `agent-plugins.yml` filter.
 - **No live re-discovery** — the configured roots are scanned once at plugin activation; adding or editing a plugin requires a plugin reload.
 - **No hook or agent-file support** — the Agent Plugins hook and agent surfaces (and the Claude Code / Codex hook dialects) are not mapped; commands are the only executable contribution besides skills and MCP tools.
+- **Dialect support covers the deployment manifest only** — `.codex-plugin/` and `.claude-plugin/` are read for identity, skills roots, and MCP declarations, and `.codebuddy-plugin/` is not read at all. Dialect-specific contributions beyond those three (hooks, agent definitions, command dialects, marketplace metadata) are ignored, the two dialects are not merged field-by-field, and a dialect `plugin.json` schema is not validated beyond the fields this loader consumes.
 - **Command rendering is a literal template substitution** — `$ARGUMENTS` is replaced verbatim without shell quoting, and no structured-argument schema from the manifest is honored.
 - **Normalized MCP server names can collide** — later colliding servers are skipped with a warning instead of being renamed.
 - **Auto-refresh is bookkeeping-file driven and unclocked** — it reads only local `installed.json` records, runs once per activation with no cross-process lock, so concurrent DSH starts on the same root race with last-writer-wins on full snapshots; a running session keeps the version it loaded until the next activation.

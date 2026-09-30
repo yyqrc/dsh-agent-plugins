@@ -52,7 +52,7 @@ describe('expandPluginRoot()', () => {
 })
 
 describe('loadPlugin()', () => {
-  it('rejects a directory without plugin.json', async () => {
+  it('rejects a directory without any manifest', async () => {
     const root = await tempRoot()
     const result = await loadPlugin(join(root, 'missing'))
     expect(result.ok).toBe(false)
@@ -159,6 +159,167 @@ describe('loadPlugin()', () => {
     if (!result.ok) return
     expect(result.plugin.mcpServers).toEqual([])
     expect(result.problems.some(problem => problem.reason.includes('unsupported type'))).toBe(true)
+  })
+})
+
+describe('dialect manifests', () => {
+  const CODEX = JSON.stringify({
+    name: 'demo',
+    version: '1.0.0',
+    skills: './skills/',
+    mcpServers: {
+      debug: { type: 'stdio', command: 'python.exe', args: ['server/debug.py'], cwd: '.' },
+    },
+  })
+
+  it('loads a plugin that carries only a Codex manifest', async () => {
+    const root = await tempRoot()
+    const dir = await writePlugin(root, 'demo', {
+      '.codex-plugin/plugin.json': CODEX,
+      'skills/apply-hotfix/SKILL.md': '---\nname: apply-hotfix\ndescription: Hotfix skill\n---\n\n# Body\n',
+    })
+    const result = await loadPlugin(dir)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.plugin.manifest.name).toBe('demo')
+    expect(result.plugin.skills.map(skill => skill.name)).toEqual(['apply-hotfix'])
+    expect(result.problems).toEqual([])
+  })
+
+  it('loads a plugin that carries only a Claude Code manifest', async () => {
+    const root = await tempRoot()
+    const dir = await writePlugin(root, 'demo', {
+      '.claude-plugin/plugin.json': JSON.stringify({ name: 'demo', mcpServers: './.claude-mcp.json' }),
+      '.claude-mcp.json': JSON.stringify({
+        mcpServers: { debug: { type: 'stdio', command: 'python.exe', args: ['${CLAUDE_PLUGIN_ROOT}/server/debug.py'] } },
+      }),
+      'skills/apply-hotfix/SKILL.md': '---\nname: apply-hotfix\ndescription: Hotfix skill\n---\n',
+    })
+    const result = await loadPlugin(dir)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.plugin.mcpServers).toEqual([{
+      serverName: 'ap_demo_debug',
+      config: {
+        transport: 'stdio',
+        serverName: 'ap_demo_debug',
+        command: 'python.exe',
+        args: [`${dir}/server/debug.py`],
+        env: {},
+        cwd: dir,
+      },
+    }])
+  })
+
+  it('lets the standard manifest outrank a dialect contribution', async () => {
+    const root = await tempRoot()
+    const dir = await writePlugin(root, 'demo', {
+      'plugin.json': JSON.stringify({ name: 'standard-name', description: 'Standard' }),
+      '.codex-plugin/plugin.json': JSON.stringify({ name: 'dialect-name', skills: './skills/' }),
+      'skills/a/SKILL.md': '---\nname: a\ndescription: A\n---\n',
+      'mcp.json': JSON.stringify({ mcpServers: { standard: { type: 'stdio', command: 'python.exe' } } }),
+    })
+    const result = await loadPlugin(dir)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.plugin.manifest.name).toBe('standard-name')
+    expect(result.plugin.mcpServers.map(server => server.serverName)).toEqual(['ap_standard-name_standard'])
+  })
+
+  it('prefers the Codex dialect over Claude Code when the standard manifest is silent', async () => {
+    const root = await tempRoot()
+    const dir = await writePlugin(root, 'demo', {
+      'plugin.json': JSON.stringify({ name: 'demo' }),
+      '.codex-plugin/plugin.json': JSON.stringify({
+        name: 'codex-name',
+        mcpServers: { chosen: { type: 'stdio', command: 'python.exe' } },
+      }),
+      '.claude-plugin/plugin.json': JSON.stringify({
+        name: 'claude-name',
+        mcpServers: { ignored: { type: 'stdio', command: 'python.exe' } },
+      }),
+    })
+    const result = await loadPlugin(dir)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.plugin.manifest.name).toBe('demo')
+    expect(result.plugin.mcpServers.map(server => server.serverName)).toEqual(['ap_demo_chosen'])
+  })
+
+  it('infers the transport when the Codex dialect omits type', async () => {
+    const root = await tempRoot()
+    const dir = await writePlugin(root, 'demo', {
+      '.codex-plugin/plugin.json': JSON.stringify({
+        name: 'demo',
+        mcpServers: { remote: { url: 'http://127.0.0.1:53317/mcp' } },
+      }),
+    })
+    const result = await loadPlugin(dir)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.plugin.mcpServers).toEqual([{
+      serverName: 'ap_demo_remote',
+      config: {
+        transport: 'streamable-http',
+        serverName: 'ap_demo_remote',
+        url: 'http://127.0.0.1:53317/mcp',
+        headers: {},
+      },
+    }])
+  })
+
+  it('reads skills roots declared by a dialect and resolves them against the plugin root', async () => {
+    const root = await tempRoot()
+    const dir = await writePlugin(root, 'demo', {
+      '.codex-plugin/plugin.json': JSON.stringify({ name: 'demo', skills: ['skills/domain'] }),
+      'skills/domain/a/SKILL.md': '---\nname: a\ndescription: A\n---\n',
+      'skills/unlisted/b/SKILL.md': '---\nname: b\ndescription: B\n---\n',
+    })
+    const result = await loadPlugin(dir)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.plugin.skills.map(skill => skill.name)).toEqual(['a'])
+  })
+
+  it('tolerates a dialect manifest that declares a missing MCP file', async () => {
+    const root = await tempRoot()
+    const dir = await writePlugin(root, 'demo', {
+      '.claude-plugin/plugin.json': JSON.stringify({ name: 'demo', mcpServers: './.claude-mcp.json' }),
+    })
+    const result = await loadPlugin(dir)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.plugin.mcpServers).toEqual([])
+    expect(result.problems).toEqual([])
+  })
+
+  it('normalizes the plugin-authored streamable-http spelling', async () => {
+    const root = await tempRoot()
+    const dir = await writePlugin(root, 'demo', {
+      'plugin.json': MANIFEST,
+      'mcp.json': JSON.stringify({ mcpServers: { remote: { type: 'streamable-http', url: 'http://127.0.0.1:53317/mcp' } } }),
+    })
+    const result = await loadPlugin(dir)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.plugin.mcpServers).toEqual([{
+      serverName: 'ap_demo_remote',
+      config: {
+        transport: 'streamable-http',
+        serverName: 'ap_demo_remote',
+        url: 'http://127.0.0.1:53317/mcp',
+        headers: {},
+      },
+    }])
+    expect(result.problems).toEqual([])
+  })
+
+  it('still rejects a directory whose only manifest is invalid', async () => {
+    const root = await tempRoot()
+    const dir = await writePlugin(root, 'demo', { '.codex-plugin/plugin.json': '{}' })
+    const result = await loadPlugin(dir)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.problems[0]?.reason).toContain('non-empty string name')
   })
 })
 
