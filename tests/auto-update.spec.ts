@@ -124,7 +124,7 @@ describe('refreshInstalledPlugins()', () => {
     expect((await readManifest(join(install, 'demo'))).version).toBe('1.0.0')
   })
 
-  it('skips a record whose source directory has no plugin.json', async () => {
+  it('skips a record whose source declares no version in any manifest', async () => {
     const root = await tempRoot()
     const install = join(root, 'install')
     const emptySource = join(root, 'empty-source')
@@ -135,7 +135,25 @@ describe('refreshInstalledPlugins()', () => {
     }), 'utf8')
     const results = await refreshInstalledPlugins(install)
     expect(results[0]?.action).toBe('skipped')
-    expect(results[0]?.reason).toContain('no plugin.json')
+    expect(results[0]?.reason).toContain('no string version')
+  })
+
+  it('reads the version from a dialect manifest when the standard one is absent', async () => {
+    const root = await tempRoot()
+    const install = join(root, 'install')
+    const source = join(root, 'source')
+    await mkdir(install, { recursive: true })
+    await writeTree(source, {
+      '.codex-plugin/plugin.json': JSON.stringify({ name: 'demo', version: '2.0.0' }),
+      'skills/a/SKILL.md': '---\nname: a\ndescription: A\n---\n',
+    })
+    await writeFile(join(install, INSTALLED_FILE), JSON.stringify({
+      demo: { source, version: '1.0.0' },
+    }), 'utf8')
+    const results = await refreshInstalledPlugins(install)
+    expect(results[0]?.action).toBe('updated')
+    expect(results[0]?.to).toBe('2.0.0')
+    expect(await readFile(join(install, 'demo', '.codex-plugin', 'plugin.json'), 'utf8')).toContain('2.0.0')
   })
 
   it('skips a record whose source plugin.json has no string version', async () => {

@@ -225,7 +225,7 @@ describe('syncDeclaredSources() local sources', () => {
     expect((await readRecord(install)).demo?.version).toBe('1.0.0')
   })
 
-  it('skips a local source without plugin.json', async () => {
+  it('skips a local source without any manifest version', async () => {
     const root = await tempRoot()
     const install = join(root, 'install')
     const sourceDir = join(root, 'demo-source')
@@ -236,6 +236,24 @@ describe('syncDeclaredSources() local sources', () => {
     const results = await syncDeclaredSources(sourcesFile, install)
     expect(results[0]?.action).toBe('skipped')
     expect(results[0]?.reason).toContain('no string version')
+  })
+
+  it('installs a dialect-only source using its dialect version', async () => {
+    const root = await tempRoot()
+    const install = join(root, 'install')
+    const sourceDir = join(root, 'demo-source')
+    const sourcesFile = join(root, 'sources.yml')
+    await writeTree(sourceDir, {
+      '.codex-plugin/plugin.json': JSON.stringify({ name: 'demo', version: '3.0.0', skills: './skills/' }),
+      '.mcp.json': JSON.stringify({ mcpServers: { debug: { type: 'stdio', command: 'python.exe', cwd: './server' } } }),
+      'skills/a/SKILL.md': '---\nname: a\ndescription: A\n---\n',
+    })
+    await mkdir(install, { recursive: true })
+    await writeFile(sourcesFile, `plugins:\n  demo:\n    source: ${JSON.stringify(sourceDir)}\n`, 'utf8')
+    const results = await syncDeclaredSources(sourcesFile, install)
+    expect(results[0]?.action).toBe('installed')
+    expect(results[0]?.to).toBe('3.0.0')
+    expect(await readFile(join(install, 'demo', '.codex-plugin', 'plugin.json'), 'utf8')).toContain('3.0.0')
   })
 
   it('keeps the installed record source when the declaration omits source', async () => {

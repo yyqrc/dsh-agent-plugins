@@ -33,12 +33,10 @@
 
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, isAbsolute, join, resolve } from 'node:path'
+import { readPluginVersion } from './manifest.ts'
 
 /** Bookkeeping file the installer writes next to the plugin directories. */
 export const INSTALLED_FILE = 'installed.json'
-
-/** Source manifest whose `version` the record's version is compared against. */
-const MANIFEST_FILE = 'plugin.json'
 
 /**
  * Names excluded from the copy so a plugin directory ships as its
@@ -147,19 +145,9 @@ async function refreshOne(root: string, name: string, rawEntry: unknown): Promis
     // against the wrong base could copy from an unintended directory.
     return { plugin: name, action: 'skipped', reason: `source path is not absolute: ${JSON.stringify(source)}` }
   }
-  const manifest = await readJson(join(source, MANIFEST_FILE))
-  if (!manifest.ok) {
-    return {
-      plugin: name,
-      action: 'skipped',
-      reason: manifest.absent
-        ? 'source directory has no plugin.json'
-        : `unreadable source plugin.json: ${manifest.reason}`,
-    }
-  }
-  const version = isObject(manifest.value) ? manifest.value.version : undefined
-  if (typeof version !== 'string' || version.trim() === '') {
-    return { plugin: name, action: 'skipped', reason: 'source plugin.json declares no string version' }
+  const version = await readPluginVersion(source)
+  if (version === undefined) {
+    return { plugin: name, action: 'skipped', reason: 'source declares no string version in plugin.json or a dialect manifest' }
   }
   const installedVersion = typeof entry.version === 'string' ? entry.version : undefined
   if (installedVersion === version) {

@@ -41,9 +41,7 @@ import {
   isPlainName,
   stageReplace,
 } from './auto-update.ts'
-
-/** Manifest whose `version` the record's version is compared against. */
-const MANIFEST_FILE = 'plugin.json'
+import { readPluginVersion as readManifestVersion } from './manifest.ts'
 
 /** Git cache directory name under the install root. */
 export const GIT_CACHE_DIR = '.marketplace-git'
@@ -356,12 +354,9 @@ function resolveSourceDir(marketplaceRoot: string, source: string): string {
   return isAbsolute(source) ? resolve(source) : resolve(marketplaceRoot, source)
 }
 
-/** Read one plugin directory's `plugin.json` version, or undefined. */
+/** Read one plugin directory's declared version, or undefined. */
 async function readPluginVersion(pluginDir: string): Promise<string | undefined> {
-  const manifest = await readJsonSafe(join(pluginDir, MANIFEST_FILE))
-  if (!manifest.ok) return undefined
-  const version = (manifest.value as Record<string, unknown> | undefined)?.version
-  return typeof version === 'string' && version.trim() !== '' ? version : undefined
+  return await readManifestVersion(pluginDir)
 }
 
 /** Read and parse the `installed.json` record, tolerating absence and malformed JSON. */

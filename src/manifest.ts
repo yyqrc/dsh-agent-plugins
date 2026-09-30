@@ -12,6 +12,9 @@
  * its input and returns a typed record or a rejection reason; the loader
  * decides whether a rejection skips one file or one plugin.
  *
+ * `readPluginVersion()` shares the same manifest ranking for the installers,
+ * so version bookkeeping follows the identity the loader would publish.
+ *
  * @module @deepseek-ai/dsh-agent-plugins/manifest
  */
 
@@ -132,7 +135,14 @@ interface CommandFrontmatter {
  * normalized to `http` on read.
  */
 type McpServerEntry =
-  | { readonly type: 'stdio'; readonly command: string; readonly args?: readonly string[]; readonly env?: Readonly<Record<string, string>> }
+  | {
+    readonly type: 'stdio'
+    readonly command: string
+    readonly args?: readonly string[]
+    readonly env?: Readonly<Record<string, string>>
+    /** Declared working directory; plugin-relative or carrying a plugin-root variable. */
+    readonly cwd?: string
+  }
   | { readonly type: 'http'; readonly url: string; readonly headers?: Readonly<Record<string, string>> }
 
 interface McpManifestFile {
@@ -226,6 +236,27 @@ function parseSkillsRoots(value: unknown): readonly string[] {
   return roots
     .filter((root): root is string => typeof root === 'string' && root.trim().length > 0)
     .map(root => root.trim())
+}
+
+/**
+ * Read the plugin version a manifest face declares, or undefined.
+ *
+ * The standard `plugin.json` version wins; a dialect supplies it only when the
+ * standard manifest is absent or omits a string version. The installers compare
+ * this value with the `installed.json` record, so a plugin shipped with dialects
+ * only (no standard manifest) is still version-tracked instead of skipped.
+ * @param root - absolute plugin directory.
+ * @returns the declared version, or undefined when no manifest declares one.
+ */
+export async function readPluginVersion(root: string): Promise<string | undefined> {
+  for (const file of [MANIFEST_FILE, ...DIALECT_DIRS.map(dir => join(dir, MANIFEST_FILE))]) {
+    const raw = await readJson(join(root, file))
+    if (!raw.ok) continue
+    if (!isObject(raw.value)) continue
+    const version = raw.value.version
+    if (typeof version === 'string' && version.trim().length > 0) return version
+  }
+  return undefined
 }
 
 /**
@@ -427,7 +458,7 @@ async function loadMcpServers(
             env: value.env === undefined
               ? {}
               : Object.fromEntries(Object.entries(value.env).map(([name, envValue]) => [name, expandPluginRoot(envValue, root)])),
-            cwd: root,
+            cwd: value.cwd === undefined ? root : resolve(root, expandPluginRoot(value.cwd, root)),
           },
         }
         : {
@@ -504,6 +535,10 @@ function parseMcpServerEntry(key: string, value: unknown): { ok: true; value: Mc
     if (env !== undefined && !isStringMap(env)) {
       return { ok: false, reason: `stdio server "${key}" env must map strings to strings` }
     }
+    const cwd = value.cwd
+    if (cwd !== undefined && typeof cwd !== 'string') {
+      return { ok: false, reason: `stdio server "${key}" cwd must be a string` }
+    }
     return {
       ok: true,
       value: {
@@ -511,6 +546,7 @@ function parseMcpServerEntry(key: string, value: unknown): { ok: true; value: Mc
         command,
         ...args !== undefined ? { args } : {},
         ...env !== undefined ? { env } : {},
+        ...typeof cwd === 'string' && cwd.trim().length > 0 ? { cwd } : {},
       },
     }
   }

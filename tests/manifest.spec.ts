@@ -112,6 +112,71 @@ describe('loadPlugin()', () => {
     }])
   })
 
+  it('resolves a declared stdio cwd below the plugin root', async () => {
+    const root = await tempRoot()
+    const dir = await writePlugin(root, 'demo', {
+      'plugin.json': MANIFEST,
+      'mcp.json': JSON.stringify({
+        mcpServers: {
+          debug: { type: 'stdio', command: 'python.exe', args: ['-m', 'pkg.server'], cwd: '${PLUGIN_ROOT}/server' },
+          relative: { type: 'stdio', command: 'python.exe', cwd: './server' },
+        },
+      }),
+    })
+    const result = await loadPlugin(dir)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.plugin.mcpServers.map(server => server.config)).toEqual([
+      {
+        transport: 'stdio',
+        serverName: 'ap_demo_debug',
+        command: 'python.exe',
+        args: ['-m', 'pkg.server'],
+        env: {},
+        cwd: join(dir, 'server'),
+      },
+      {
+        transport: 'stdio',
+        serverName: 'ap_demo_relative',
+        command: 'python.exe',
+        args: [],
+        env: {},
+        cwd: join(dir, 'server'),
+      },
+    ])
+  })
+
+  it('falls back to the plugin root when stdio cwd is absent or blank', async () => {
+    const root = await tempRoot()
+    const dir = await writePlugin(root, 'demo', {
+      'plugin.json': MANIFEST,
+      'mcp.json': JSON.stringify({
+        mcpServers: {
+          absent: { type: 'stdio', command: 'python.exe' },
+          blank: { type: 'stdio', command: 'python.exe', cwd: '   ' },
+        },
+      }),
+    })
+    const result = await loadPlugin(dir)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.plugin.mcpServers.map(server => server.config.transport === 'stdio' ? server.config.cwd : undefined))
+      .toEqual([dir, dir])
+  })
+
+  it('rejects an mcp.json entry whose cwd is not a string', async () => {
+    const root = await tempRoot()
+    const dir = await writePlugin(root, 'demo', {
+      'plugin.json': MANIFEST,
+      'mcp.json': JSON.stringify({ mcpServers: { bad: { type: 'stdio', command: 'python.exe', cwd: 7 } } }),
+    })
+    const result = await loadPlugin(dir)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.plugin.mcpServers).toEqual([])
+    expect(result.problems.some(problem => problem.reason.includes('cwd must be a string'))).toBe(true)
+  })
+
   it('loads http MCP servers as streamable-http configs', async () => {
     const root = await tempRoot()
     const dir = await writePlugin(root, 'demo', {
